@@ -618,3 +618,41 @@ fn warp_frame(frame: &Frame, p: &ViewParams, out_w: u32, out_h: u32, swap_rb: bo
 
     out
 }
+
+#[cfg(test)]
+impl StreamHandle {
+    pub fn dummy_for_test() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let slot = Arc::new(Mutex::new(FrameSlot::default()));
+        let status = Arc::new(Mutex::new(Status::Streaming {
+            width: 1920,
+            height: 1080,
+            fps: 60.0,
+            decode_ms: 2.5,
+        }));
+        let sockets = Arc::new(Mutex::new(Vec::new()));
+        let recording = Arc::new(AtomicBool::new(false));
+        let (record_tx, _record_rx) = unbounded();
+        let auto_reconnect = Arc::new(AtomicBool::new(false));
+        let config = StreamConfig {
+            serial: "dummy".into(),
+            display_id: 0,
+            max_size: 1920,
+            video_bit_rate: 30_000_000,
+            max_fps: 60,
+            audio: false,
+            audio_bit_rate: 128_000,
+        };
+        Self {
+            stop,
+            join: None,
+            sockets,
+            record_tx,
+            recording,
+            auto_reconnect,
+            slot,
+            status,
+            config,
+        }
+    }
+}

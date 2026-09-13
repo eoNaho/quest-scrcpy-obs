@@ -13,8 +13,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The "solid" Quest 3 view profile applied by the one-click preset button.
-/// Left-eye crop + lens-flatten coefficients + tilt. Tune to taste; the GUI also
-/// remembers your last manual values via the config file.
 const QUEST3_CROP: [f32; 4] = [0.0, 0.0, 0.5, 1.0];
 const QUEST3_K1: f32 = 0.02;
 const QUEST3_K2: f32 = -0.20;
@@ -38,13 +36,10 @@ const QUESTPRO_K1: f32 = 0.01;
 const QUESTPRO_K2: f32 = -0.04;
 const QUESTPRO_TILT: f32 = 0.0;
 
-/// One-click quality presets — applied without reconnecting (UI-only knobs).
-/// Low-latency: smaller encode size + aggressive bitrate cap = fewer encode cycles.
-const PRESET_LOWLAT: (u32, u32, u32) = (1440, 60, 12); // (max_size, fps, mbps)
-/// High-quality: full 1920px encode at high bitrate — best detail for OBS.
+/// One-click quality presets
+const PRESET_LOWLAT: (u32, u32, u32) = (1440, 60, 12);
 const PRESET_HIQUAL: (u32, u32, u32) = (1920, 60, 20);
 
-/// Quality knobs that require a (re)connect to take effect.
 #[derive(Clone, PartialEq)]
 struct Settings {
     display_id: u32,
@@ -62,7 +57,6 @@ impl Default for Settings {
 
 type DisplayFetch = Arc<Mutex<Option<anyhow::Result<Vec<DisplayInfo>>>>>;
 
-/// Optional overrides coming from the CLI `mirror` subcommand.
 #[derive(Default)]
 pub struct StartupConfig {
     pub serial: Option<String>,
@@ -82,71 +76,156 @@ pub struct App {
     settings: Settings,
 
     stream: Option<StreamHandle>,
-    /// Live "flat view": the whole undistorted Quest view via the unrooted agent.
     flat: Option<crate::flat::FlatHandle>,
     texture: Option<egui::TextureHandle>,
     last_generation: u64,
     tex_size: [usize; 2],
-    /// Newest decoded frame, kept so we can screenshot the current view.
     last_frame: Option<Frame>,
-    /// Transient feedback for capture actions (screenshot/record paths).
     capture_msg: Option<String>,
 
-    /// Live Spout2 output so OBS can add this view as a source directly.
     spout_enabled: bool,
     spout: Option<crate::spout::SpoutOutput>,
     spout_error: Option<String>,
 
-    /// Live OS virtual-camera output (shows up as a webcam in any app).
     vcam_enabled: bool,
     vcam: Option<crate::vcam::VirtualCamOutput>,
     vcam_error: Option<String>,
 
-    /// Crop window in normalised texture coordinates (0..1).
     uv: Rect,
-
-    /// Flatten the Quest's lens (radial) distortion into a rectilinear 2D image.
     lens_correct: bool,
-    /// Radial distortion coefficients (k1 quadratic, k2 quartic).
     lens_k1: f32,
     lens_k2: f32,
-    /// Extra in-plane rotation to straighten residual tilt (degrees).
     rotation_deg: f32,
 
     want_autostart: bool,
-    /// Whether the Panel view should automatically reconnect on Wi-Fi drops.
     auto_reconnect: bool,
-    /// A display query is requested but waits until it's safe to run (the list
-    /// server would otherwise delete the jar out from under a connecting stream).
     need_display_fetch: bool,
     fetch_inflight: bool,
 
-    /// Wireless-adb: the ip:port being typed, remembered addresses, and the
-    /// result of an in-flight `adb connect` running on a background thread.
     remote_input: String,
     remotes: Vec<String>,
     connect_result: Arc<Mutex<Option<(String, Result<String, String>)>>>,
     connecting: bool,
 
-    /// Streamer mode: hide device serials / saved Wi-Fi addresses from the UI
-    /// so they don't leak into a capture. `None` = auto (follow `obs_detected`);
-    /// `Some(_)` = manual override, set by clicking the toolbar toggle.
     streamer_forced: Option<bool>,
     obs_detected: bool,
     last_obs_check: Instant,
 
-    /// Last-persisted settings + a debounce timer, so edits auto-save shortly
-    /// after the user stops fiddling (rather than thrashing the disk each frame).
     persisted: Config,
     dirty_since: Option<Instant>,
+
+    settings_open: bool,
+}
+
+/// Custom UI Widget: A modern Toggle Switch (replaces standard checkboxes)
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let desired_size = vec2(36.0, 20.0);
+    let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, ""));
+
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, *on);
+        let rect = rect.expand(visuals.expansion);
+        let radius = 0.5 * rect.height();
+        
+        // Colors matching our Purple Flat theme
+        let bg_color = if *on { Color32::from_rgb(0x8b, 0x5c, 0xf6) } else { Color32::from_rgb(0x24, 0x22, 0x2e) };
+        let border_color = if *on { Color32::from_rgb(0x8b, 0x5c, 0xf6) } else { Color32::from_rgb(0x31, 0x2f, 0x40) };
+        
+        ui.painter().rect(
+            rect,
+            egui::CornerRadius::same(radius as u8),
+            bg_color,
+            egui::Stroke::new(1.0f32, border_color),
+            egui::StrokeKind::Middle,
+        );
+        
+        let how_on = ui.ctx().animate_bool(response.id, *on);
+        let circle_x = egui::lerp((rect.left() + radius + 2.0)..=(rect.right() - radius - 2.0), how_on);
+        let center = pos2(circle_x, rect.center().y);
+        
+        ui.painter().circle(
+            center,
+            0.75 * radius,
+            Color32::WHITE,
+            egui::Stroke::NONE,
+        );
+    }
+    response
+}
+
+fn apply_purple_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    let bg_main = Color32::from_rgb(0x14, 0x13, 0x1a);
+    let bg_sidebar = Color32::from_rgb(0x1a, 0x19, 0x22);
+    let bg_input = Color32::from_rgb(0x24, 0x22, 0x2e);
+    let border = Color32::from_rgb(0x31, 0x2f, 0x40);
+    let accent = Color32::from_rgb(0x8b, 0x5c, 0xf6);
+    let accent_hover = Color32::from_rgb(0x7c, 0x3a, 0xed);
+    let text_main = Color32::from_rgb(0xe2, 0xe8, 0xf0);
+    let text_muted = Color32::from_rgb(0x8b, 0x8a, 0x96);
+
+    visuals.panel_fill = bg_main;
+    visuals.window_fill = bg_sidebar;
+    visuals.window_stroke = egui::Stroke::new(1.0f32, border);
+    
+    // Flat aesthetic: disable default egui shadows
+    visuals.window_shadow = egui::epaint::Shadow::NONE;
+    visuals.popup_shadow = egui::epaint::Shadow::NONE;
+    visuals.extreme_bg_color = bg_input;
+
+    let rounding = egui::CornerRadius::same(6);
+
+    visuals.widgets.noninteractive.bg_fill = bg_input;
+    visuals.widgets.noninteractive.weak_bg_fill = bg_input;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0f32, border);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0f32, text_muted);
+    visuals.widgets.noninteractive.corner_radius = rounding;
+
+    visuals.widgets.inactive.bg_fill = bg_input;
+    visuals.widgets.inactive.weak_bg_fill = bg_input;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0f32, border);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0f32, text_main);
+    visuals.widgets.inactive.corner_radius = rounding;
+
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x2d, 0x2b, 0x3a);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x2d, 0x2b, 0x3a);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0f32, accent);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0f32, Color32::WHITE);
+    visuals.widgets.hovered.corner_radius = rounding;
+
+    visuals.widgets.active.bg_fill = accent;
+    visuals.widgets.active.weak_bg_fill = accent;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0f32, accent_hover);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0f32, Color32::WHITE);
+    visuals.widgets.active.corner_radius = rounding;
+
+    visuals.widgets.open.bg_fill = bg_input;
+    visuals.widgets.open.weak_bg_fill = bg_input;
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0f32, accent);
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0f32, text_main);
+    visuals.widgets.open.corner_radius = rounding;
+
+    visuals.selection.bg_fill = accent;
+    visuals.selection.stroke = egui::Stroke::new(1.0f32, Color32::WHITE);
+
+    ctx.set_visuals(visuals);
+
+    ctx.global_style_mut(|style| {
+        style.spacing.item_spacing = vec2(8.0, 10.0);
+        style.spacing.button_padding = vec2(8.0, 6.0);
+    });
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, startup: StartupConfig) -> Self {
-        // egui's bundled font has no emoji glyphs, so load a system font that does
-        // (Segoe UI Emoji / Symbol) — otherwise 🥽🔊📷 etc. render as tofu boxes.
-        install_emoji_font(&cc.egui_ctx);
-        // Saved settings are the baseline; explicit CLI flags override quality knobs.
+        apply_purple_theme(&cc.egui_ctx);
+        install_custom_fonts(&cc.egui_ctx);
+        
         let cfg = Config::load().unwrap_or_default();
         let mut settings = Settings {
             display_id: cfg.display_id,
@@ -155,21 +234,11 @@ impl App {
             max_fps: cfg.max_fps,
             audio: cfg.audio,
         };
-        if let Some(v) = startup.display_id {
-            settings.display_id = v;
-        }
-        if let Some(v) = startup.max_size {
-            settings.max_size = v;
-        }
-        if let Some(v) = startup.bitrate_mbps {
-            settings.bitrate_mbps = v;
-        }
-        if let Some(v) = startup.max_fps {
-            settings.max_fps = v;
-        }
-        if let Some(v) = startup.audio {
-            settings.audio = v;
-        }
+        if let Some(v) = startup.display_id { settings.display_id = v; }
+        if let Some(v) = startup.max_size { settings.max_size = v; }
+        if let Some(v) = startup.bitrate_mbps { settings.bitrate_mbps = v; }
+        if let Some(v) = startup.max_fps { settings.max_fps = v; }
+        if let Some(v) = startup.audio { settings.audio = v; }
 
         let mut app = Self {
             devices: Vec::new(),
@@ -190,10 +259,7 @@ impl App {
             vcam_enabled: false,
             vcam: None,
             vcam_error: None,
-            uv: Rect::from_min_max(
-                pos2(cfg.uv[0], cfg.uv[1]),
-                pos2(cfg.uv[2], cfg.uv[3]),
-            ),
+            uv: Rect::from_min_max(pos2(cfg.uv[0], cfg.uv[1]), pos2(cfg.uv[2], cfg.uv[3])),
             lens_correct: cfg.lens_correct,
             lens_k1: cfg.lens_k1,
             lens_k2: cfg.lens_k2,
@@ -211,12 +277,11 @@ impl App {
             last_obs_check: Instant::now(),
             persisted: cfg,
             dirty_since: None,
+            settings_open: false,
         };
-        // Snapshot what we actually ended up with (after CLI overrides) so we
-        // don't immediately re-save on first frame.
+        
         app.persisted = app.current_config();
         app.refresh_devices();
-        // An explicit --serial overrides auto-pick.
         if let Some(s) = startup.serial {
             if app.devices.iter().any(|d| d.serial == s) {
                 app.selected_serial = Some(s);
@@ -229,14 +294,13 @@ impl App {
     fn refresh_devices(&mut self) {
         let prev = self.selected_serial.clone();
         self.devices = adb::list_devices().unwrap_or_default();
-        let online: Vec<&Device> =
-            self.devices.iter().filter(|d| d.state == "device").collect();
+        let online: Vec<&Device> = self.devices.iter().filter(|d| d.state == "device").collect();
 
-        // Keep the current selection if it's still around, else prefer USB.
         let still_present = prev
             .as_ref()
             .map(|s| online.iter().any(|d| &d.serial == s))
             .unwrap_or(false);
+            
         if !still_present {
             self.selected_serial = online
                 .iter()
@@ -247,20 +311,14 @@ impl App {
         }
     }
 
-    /// Request a display query; the actual (jar-consuming) list server runs later
-    /// from [`drive_display_fetch`], once no stream is mid-connect.
     fn request_display_fetch(&mut self) {
         self.displays.clear();
         self.need_display_fetch = true;
     }
 
-    /// Running a list server deletes the jar; it's only safe when nothing is
-    /// connecting (idle, or already streaming/stopped).
     fn fetch_safe(&self) -> bool {
         match self.stream.as_ref().map(|s| s.status()) {
-            None | Some(Status::Streaming { .. }) | Some(Status::Error(_)) | Some(Status::Stopped) => {
-                true
-            }
+            None | Some(Status::Streaming { .. }) | Some(Status::Error(_)) | Some(Status::Stopped) => true,
             Some(Status::Connecting) => false,
         }
     }
@@ -289,14 +347,9 @@ impl App {
             self.fetch_inflight = false;
             match res {
                 Ok(mut list) => {
-                    // Show every real display so the user can pick (Quest exposes
-                    // several 4128x2208 panels — e.g. id 0 vs 9 — and which one
-                    // mirrors correctly varies). Only drop the 1x1 sentinels.
                     list.retain(|d| d.width >= 2 && d.height >= 2);
-                    // Biggest first: the real headset panels sort to the top.
                     list.sort_by(|a, b| (b.width * b.height).cmp(&(a.width * a.height)));
                     self.displays = list;
-                    // Keep the current display if still valid; otherwise prefer 0.
                     if !self.displays.iter().any(|d| d.id == self.settings.display_id) {
                         if self.displays.iter().any(|d| d.id == 0) {
                             self.settings.display_id = 0;
@@ -312,7 +365,7 @@ impl App {
 
     fn connect(&mut self, ctx: &egui::Context) {
         let Some(serial) = self.selected_serial.clone() else { return };
-        self.stream = None; // drop & stop any existing session first
+        self.stream = None; 
         self.texture = None;
         self.last_frame = None;
         self.last_generation = 0;
@@ -336,9 +389,6 @@ impl App {
         self.last_frame = None;
     }
 
-    /// Start the live flat-view source: the whole undistorted Quest view (home
-    /// environment + panels) captured by the unrooted on-device agent. No lens
-    /// de-warp or crop — the device composites it flat for us.
     fn connect_flat(&mut self, ctx: &egui::Context) {
         let Some(serial) = self.selected_serial.clone() else { return };
         self.stream = None;
@@ -346,28 +396,21 @@ impl App {
         self.texture = None;
         self.last_frame = None;
         self.last_generation = 0;
-        // The flat view is already undistorted, full-frame and level — no crop,
-        // no lens de-warp, and crucially no tilt (else we'd rotate a flat image).
         self.lens_correct = false;
         self.rotation_deg = 0.0;
         self.uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-        // Resolution / bitrate / fps from the quality knobs. We pass a *square*
-        // bounding box (max_size × max_size); the agent fits the real flat-view
-        // aspect inside it, so the longer side reaches max_size whatever the
-        // shape — no forced 16:9 that would letterbox/crop the view.
         let cfg = self.flat_config();
         self.flat = Some(crate::flat::FlatHandle::start(
             serial,
             cfg.max_size,
-            cfg.max_size, // square bounding box; the agent fits the real aspect in it
+            cfg.max_size, 
             cfg.bitrate,
             cfg.fps,
-            self.settings.audio, // initial mute state; toggled live afterwards
+            self.settings.audio,
             ctx.clone(),
         ));
     }
 
-    /// Apply the baked-in "good Quest 3 view" in one click.
     fn apply_quest3_preset(&mut self) {
         self.uv = Rect::from_min_max(pos2(QUEST3_CROP[0], QUEST3_CROP[1]), pos2(QUEST3_CROP[2], QUEST3_CROP[3]));
         self.lens_correct = true;
@@ -376,7 +419,6 @@ impl App {
         self.rotation_deg = QUEST3_TILT;
     }
 
-    /// Apply the baked-in "good Quest 2 view" in one click.
     fn apply_quest2_preset(&mut self) {
         self.uv = Rect::from_min_max(pos2(QUEST2_CROP[0], QUEST2_CROP[1]), pos2(QUEST2_CROP[2], QUEST2_CROP[3]));
         self.lens_correct = true;
@@ -385,7 +427,6 @@ impl App {
         self.rotation_deg = QUEST2_TILT;
     }
 
-    /// Apply the baked-in "good Quest Pro view" in one click.
     fn apply_questpro_preset(&mut self) {
         self.uv = Rect::from_min_max(pos2(QUESTPRO_CROP[0], QUESTPRO_CROP[1]), pos2(QUESTPRO_CROP[2], QUESTPRO_CROP[3]));
         self.lens_correct = true;
@@ -394,7 +435,6 @@ impl App {
         self.rotation_deg = QUESTPRO_TILT;
     }
 
-    /// Apply the baked-in "good Quest 3S view" in one click.
     fn apply_quest3s_preset(&mut self) {
         self.uv = Rect::from_min_max(pos2(QUEST3S_CROP[0], QUEST3S_CROP[1]), pos2(QUEST3S_CROP[2], QUEST3S_CROP[3]));
         self.lens_correct = true;
@@ -403,24 +443,18 @@ impl App {
         self.rotation_deg = QUEST3S_TILT;
     }
 
-    /// Apply a quality (max_size / fps / bitrate) preset without disconnecting.
-    /// A reconnect is still needed for the new settings to take effect on-device,
-    /// but the controls are updated immediately so the user sees what will apply.
     fn apply_quality_preset(&mut self, max_size: u32, fps: u32, mbps: u32) {
         self.settings.max_size = max_size;
         self.settings.max_fps = fps;
         self.settings.bitrate_mbps = mbps;
     }
 
-    /// Propagate the current `auto_reconnect` flag to a running stream so the
-    /// toggle takes effect immediately without requiring a full reconnect.
     fn sync_auto_reconnect(&self) {
         if let Some(s) = &self.stream {
             s.auto_reconnect.store(self.auto_reconnect, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
-    /// Snapshot the persistable settings from the current UI state.
     fn current_config(&self) -> Config {
         Config {
             lens_correct: self.lens_correct,
@@ -437,8 +471,6 @@ impl App {
         }
     }
 
-    /// Kick off `adb connect <addr>` on a background thread (network calls can
-    /// hang on a bad address, so never run them on the UI thread).
     fn start_remote_connect(&mut self, addr: String, ctx: egui::Context) {
         let addr = adb::normalize_addr(&addr);
         if addr.is_empty() || self.connecting {
@@ -454,11 +486,8 @@ impl App {
         });
     }
 
-    /// Connect every remembered address (sequentially) on one background thread.
     fn start_connect_all(&mut self, ctx: egui::Context) {
-        if self.connecting || self.remotes.is_empty() {
-            return;
-        }
+        if self.connecting || self.remotes.is_empty() { return; }
         self.connecting = true;
         self.capture_msg = Some("🔗 Connecting saved devices…".into());
         let slot = self.connect_result.clone();
@@ -466,17 +495,13 @@ impl App {
         std::thread::spawn(move || {
             let mut ok = 0usize;
             for r in &remotes {
-                if adb::connect(r).is_ok() {
-                    ok += 1;
-                }
+                if adb::connect(r).is_ok() { ok += 1; }
             }
-            *slot.lock().unwrap() =
-                Some(("*".to_string(), Ok(format!("connected {ok}/{}", remotes.len()))));
+            *slot.lock().unwrap() = Some(("*".to_string(), Ok(format!("connected {ok}/{}", remotes.len()))));
             ctx.request_repaint();
         });
     }
 
-    /// Apply the result of a finished `adb connect`.
     fn poll_connect(&mut self) {
         let taken = self.connect_result.lock().unwrap().take();
         let Some((addr, res)) = taken else { return };
@@ -488,7 +513,6 @@ impl App {
                     self.remotes.push(addr.clone());
                 }
                 self.refresh_devices();
-                // Prefer the freshly-connected device.
                 if self.devices.iter().any(|d| d.serial == addr && d.state == "device") {
                     self.selected_serial = Some(addr);
                     self.request_display_fetch();
@@ -498,14 +522,10 @@ impl App {
         }
     }
 
-    /// Persist settings shortly after they stop changing (debounced).
     fn autosave(&mut self) {
         let cur = self.current_config();
         if cur != self.persisted {
-            // Something changed; (re)start the debounce timer.
-            if self.dirty_since.is_none() {
-                self.dirty_since = Some(Instant::now());
-            }
+            if self.dirty_since.is_none() { self.dirty_since = Some(Instant::now()); }
         }
         if let Some(t) = self.dirty_since {
             if t.elapsed().as_millis() >= 500 {
@@ -517,41 +537,29 @@ impl App {
         }
     }
 
-    /// Save the currently-visible crop as a PNG next to the executable.
     fn take_screenshot(&mut self) {
-        let Some(frame) = &self.last_frame else {
-            self.capture_msg = Some("No frame to capture yet.".into());
-            return;
-        };
+        let Some(frame) = &self.last_frame else { return; };
         match save_crop_png(frame, self.uv) {
             Ok(path) => self.capture_msg = Some(format!("📷 Saved {}", path.display())),
             Err(e) => self.capture_msg = Some(format!("Screenshot failed: {e}")),
         }
     }
 
-    /// Toggle clip recording on the active stream.
     fn toggle_recording(&mut self) {
         let recording = self.stream.as_ref().map(|s| s.is_recording()).unwrap_or(false)
             || self.flat.as_ref().map(|f| f.is_recording()).unwrap_or(false);
-        if self.stream.is_none() && self.flat.is_none() {
-            return;
-        }
+        if self.stream.is_none() && self.flat.is_none() { return; }
+        
         if recording {
-            if let Some(s) = &self.stream {
-                s.stop_recording();
-            }
-            if let Some(f) = &self.flat {
-                f.stop_recording();
-            }
+            if let Some(s) = &self.stream { s.stop_recording(); }
+            if let Some(f) = &self.flat { f.stop_recording(); }
             self.capture_msg = Some("⏹ Recording saved.".into());
         } else {
             match capture_path("clip", "mp4") {
                 Ok(path) => {
                     if let Some(f) = &self.flat {
-                        // The flat view is already what's on screen — record as-is.
                         f.start_recording(path.clone());
                     } else if let Some(s) = &self.stream {
-                        // Capture exactly what's on screen: current crop + lens + tilt.
                         let view = ViewParams {
                             uv: [self.uv.min.x, self.uv.min.y, self.uv.max.x, self.uv.max.y],
                             lens_correct: self.lens_correct,
@@ -568,8 +576,6 @@ impl App {
         }
     }
 
-    /// Is the selected device a Meta/Quest headset? Those default to the flat
-    /// view (the "meta protocol"); the panel crop/lens/tilt tools don't apply.
     fn selected_is_quest(&self) -> bool {
         self.selected_serial
             .as_ref()
@@ -582,8 +588,6 @@ impl App {
     }
 
     fn active_config_matches(&self) -> bool {
-        // The flat view has its own knobs (size/bitrate/fps/audio) — it needs a
-        // reconnect to pick up changes just like the panel mirror does.
         if let Some(f) = &self.flat {
             let want = self.flat_config();
             return f.config == want;
@@ -596,8 +600,6 @@ impl App {
             && s.config.audio == self.settings.audio
     }
 
-    /// The flat-view parameters implied by the current settings. Audio isn't
-    /// here — it's applied live (see `set_audio_enabled`), no reconnect needed.
     fn flat_config(&self) -> crate::flat::FlatConfig {
         crate::flat::FlatConfig {
             max_size: if self.settings.max_size >= 640 { self.settings.max_size } else { 1920 },
@@ -606,7 +608,6 @@ impl App {
         }
     }
 
-    /// Pull the newest decoded frame into the GPU texture, if any.
     fn sync_texture(&mut self, ctx: &egui::Context) {
         let slot_arc = if let Some(f) = &self.flat {
             f.slot.clone()
@@ -616,9 +617,7 @@ impl App {
             return;
         };
         let mut slot = slot_arc.lock().unwrap();
-        if slot.generation == self.last_generation {
-            return;
-        }
+        if slot.generation == self.last_generation { return; }
         if let Some(frame) = slot.frame.take() {
             self.last_generation = slot.generation;
             drop(slot);
@@ -627,20 +626,13 @@ impl App {
             self.tex_size = size;
             match &mut self.texture {
                 Some(t) => t.set(image, egui::TextureOptions::LINEAR),
-                None => {
-                    self.texture =
-                        Some(ctx.load_texture("mirror", image, egui::TextureOptions::LINEAR))
-                }
+                None => self.texture = Some(ctx.load_texture("mirror", image, egui::TextureOptions::LINEAR))
             }
-            // Keep the raw frame around for screenshots.
             self.last_frame = Some(frame);
             self.push_live_outputs();
         }
     }
 
-    /// The crop/lens/tilt view currently on screen, and the output size it
-    /// implies — the flat view has no crop, so it's the identity view at the
-    /// frame's own size.
     fn live_view(&self, frame: &Frame) -> (ViewParams, u32, u32) {
         if self.flat.is_some() {
             (ViewParams::default(), frame.width, frame.height)
@@ -657,20 +649,14 @@ impl App {
         }
     }
 
-    /// Mirror the current view into Spout and/or the virtual camera, for
-    /// whichever outputs are enabled. Reuses the same warp as recording, at
-    /// decode fps.
     fn push_live_outputs(&mut self) {
-        if !self.spout_enabled && !self.vcam_enabled {
-            return;
-        }
+        if !self.spout_enabled && !self.vcam_enabled { return; }
         let Some(frame) = &self.last_frame else { return };
         let (view, ow, oh) = self.live_view(frame);
 
         if self.spout_enabled {
             let bgra = crate::stream::warp_to_bgra(frame, &view, ow, oh);
-            let sender =
-                self.spout.get_or_insert_with(|| crate::spout::SpoutOutput::new("Quest scrcpy"));
+            let sender = self.spout.get_or_insert_with(|| crate::spout::SpoutOutput::new("Quest scrcpy"));
             match sender.send(&bgra, ow, oh) {
                 Ok(()) => self.spout_error = None,
                 Err(e) => {
@@ -695,35 +681,27 @@ impl App {
         }
     }
 
-    /// Re-check whether OBS is running every couple seconds — cheap enough
-    /// (one process-list snapshot) but no need to do it every UI frame.
     fn poll_obs_detection(&mut self) {
-        if self.last_obs_check.elapsed() < Duration::from_secs(2) {
-            return;
-        }
+        if self.last_obs_check.elapsed() < Duration::from_secs(2) { return; }
         self.last_obs_check = Instant::now();
         self.obs_detected = crate::obsdetect::is_running();
     }
 
-    /// Whether identifying info (device serials, saved Wi-Fi addresses)
-    /// should currently be masked in the UI.
     fn streamer_active(&self) -> bool {
         self.streamer_forced.unwrap_or(self.obs_detected)
     }
 }
 
 impl eframe::App for App {
-    // Non-painting work runs here, before `ui`.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.want_autostart && self.selected_serial.is_some() && self.stream.is_none() {
             self.want_autostart = false;
-            self.request_display_fetch(); // happens once the stream is up
+            self.request_display_fetch();
             self.connect(ctx);
         }
         self.poll_connect();
         self.poll_displays();
         self.drive_display_fetch();
-        // The audio toggle applies to the flat stream live (no reconnect).
         if let Some(f) = &self.flat {
             f.set_audio_enabled(self.settings.audio);
         }
@@ -733,644 +711,956 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        ui.painter().rect_filled(ui.max_rect(), 0.0, Color32::from_rgb(0x14, 0x13, 0x1a));
         self.top_bar(ui);
-        self.bottom_bar(ui);
+        self.sidebar(ui);
         self.central_video(ui);
+        self.settings_modal(ui.ctx());
     }
+}
+
+mod icon {
+    pub const VR_HEADSET: &str = "\u{f729}";   // fa-vr-cardboard
+    pub const DISPLAY: &str = "\u{f26c}";      // fa-tv
+    pub const EXPAND: &str = "\u{f065}";       // fa-expand
+    pub const STREAMER: &str = "\u{f144}";     // fa-circle-play
+    pub const WIFI: &str = "\u{f1eb}";         // fa-wifi
+    pub const BITRATE: &str = "\u{f080}";      // fa-chart-bar
+    pub const FPS: &str = "\u{f625}";          // fa-gauge-high
+    pub const AUDIO: &str = "\u{f028}";        // fa-volume-high
+    pub const BOLT: &str = "\u{e0b7}";         // fa-bolt-lightning
+    pub const GEM: &str = "\u{f3a5}";          // fa-gem
+    pub const PLAY: &str = "\u{f04b}";         // fa-play
+    pub const REFRESH: &str = "\u{f2f9}";      // fa-rotate-right
+    pub const LINK: &str = "\u{f0c1}";         // fa-link
+    pub const GEAR: &str = "\u{f013}";         // fa-gear
+    pub const CAMERA: &str = "\u{f030}";       // fa-camera
+    pub const VIDEO: &str = "\u{f03d}";        // fa-video
+    pub const STOP: &str = "\u{f04d}";         // fa-stop
+    pub const XMARK: &str = "\u{f00d}";        // fa-xmark
+}
+
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.5, color);
+}
+
+fn combo_chevron_icon(ui: &egui::Ui, rect: Rect, visuals: &egui::style::WidgetVisuals, is_open: bool) {
+    let painter = ui.painter();
+    let center = rect.center();
+    let color = visuals.fg_stroke.color;
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    let h = 2.5;
+    let w = 4.0;
+    if is_open {
+        painter.line_segment([center + vec2(-w, h * 0.5), center + vec2(0.0, -h * 0.5)], stroke);
+        painter.line_segment([center + vec2(0.0, -h * 0.5), center + vec2(w, h * 0.5)], stroke);
+    } else {
+        painter.line_segment([center + vec2(-w, -h * 0.5), center + vec2(0.0, h * 0.5)], stroke);
+        painter.line_segment([center + vec2(0.0, h * 0.5), center + vec2(w, -h * 0.5)], stroke);
+    }
+}
+
+fn custom_combobox(id_salt: impl std::hash::Hash) -> egui::ComboBox {
+    egui::ComboBox::from_id_salt(id_salt).icon(combo_chevron_icon)
+}
+
+fn col_header(ui: &mut egui::Ui, icon_char: &str, text: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(
+            egui::RichText::new(icon_char)
+                .size(10.5)
+                .color(Color32::from_rgb(0x8b, 0x8a, 0x96)),
+        );
+        ui.label(
+            egui::RichText::new(text)
+                .size(10.5)
+                .strong()
+                .color(Color32::from_rgb(0x8b, 0x8a, 0x96)),
+        );
+    });
+}
+
+fn preset_button(ui: &mut egui::Ui, size: [f32; 2], is_active: bool, icon_char: &str, text: &str) -> egui::Response {
+    let (bg, border, text_color) = if is_active {
+        (
+            Color32::from_rgb(0x1c, 0x5e, 0x89), // Ocean Blue from reference
+            Color32::from_rgb(0x38, 0xbd, 0xf8), // Cyan border
+            Color32::WHITE,
+        )
+    } else {
+        (
+            Color32::from_rgb(0x1e, 0x1d, 0x29),
+            Color32::from_rgb(0x31, 0x2f, 0x40),
+            Color32::from_rgb(0xe2, 0xe8, 0xf0),
+        )
+    };
+
+    let rich = egui::RichText::new(format!("{icon_char}  {text}"))
+        .size(12.5)
+        .strong()
+        .color(text_color);
+
+    let btn = egui::Button::new(rich)
+        .fill(bg)
+        .stroke(egui::Stroke::new(1.0f32, border))
+        .corner_radius(egui::CornerRadius::same(6))
+        .truncate();
+
+    ui.add_sized(size, btn)
 }
 
 impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("controls").show_inside(ui, |ui| {
-            let ctx = ui.ctx().clone();
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                // Device picker.
-                let dev_label = self
-                    .selected_serial
-                    .as_ref()
-                    .and_then(|s| self.devices.iter().find(|d| &d.serial == s))
-                    .map(|d| d.label_masked(self.streamer_active()))
-                    .unwrap_or_else(|| "No device".into());
-                let mut changed_device = false;
-                egui::ComboBox::from_id_salt("device")
-                    .selected_text(dev_label)
-                    .width(260.0)
+        let frame = egui::Frame::default()
+            .fill(Color32::from_rgb(0x0f, 0x0e, 0x13)) // bg-header
+            .inner_margin(egui::Margin::symmetric(20, 14))
+            .stroke(egui::Stroke::new(1.0f32, Color32::from_rgb(0x31, 0x2f, 0x40)));
+
+        egui::Panel::top("header")
+            .frame(frame)
+            .exact_size(60.0)
+            .show_inside(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    // Left: Logo & Title
+                    ui.label(
+                        egui::RichText::new("🥽")
+                            .size(22.0)
+                            .color(Color32::from_rgb(0xe2, 0xe8, 0xf0)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("QUEST STREAMER")
+                            .strong()
+                            .size(13.0)
+                            .color(Color32::from_rgb(0xe2, 0xe8, 0xf0)),
+                    );
+
+                    // Right side: Status & Settings Gear
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let gear_color = if self.settings_open {
+                            Color32::from_rgb(0xe2, 0xe8, 0xf0)
+                        } else {
+                            Color32::from_rgb(0x8b, 0x8a, 0x96)
+                        };
+                        let gear_btn = egui::Button::new(
+                            egui::RichText::new(icon::GEAR).size(16.0).color(gear_color)
+                        ).fill(Color32::TRANSPARENT).stroke(egui::Stroke::NONE);
+
+                        if ui.add(gear_btn).on_hover_text("Configurações Avançadas").clicked() {
+                            self.settings_open = !self.settings_open;
+                        }
+
+                        ui.add_space(20.0);
+                        self.status_header_badge(ui);
+                    });
+                });
+            });
+    }
+
+    fn status_header_badge(&self, ui: &mut egui::Ui) {
+        let status = if let Some(f) = &self.flat {
+            f.status()
+        } else if let Some(s) = &self.stream {
+            s.status()
+        } else {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                status_dot(ui, Color32::from_rgb(0xef, 0x44, 0x44));
+                ui.label(egui::RichText::new("Desconectado").size(13.0).color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+            });
+            return;
+        };
+
+        match status {
+            Status::Connecting => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Conectando…").size(13.0).color(Color32::from_rgb(0x8b, 0x5c, 0xf6)));
+                });
+            }
+            Status::Streaming { width, height, fps, decode_ms } => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    status_dot(ui, Color32::from_rgb(0x22, 0xc5, 0x5e));
+                    let label = if decode_ms > 0.1 {
+                        format!("{width}×{height}  ·  {fps:.0} fps  ·  {decode_ms:.1} ms")
+                    } else {
+                        format!("{width}×{height}  ·  {fps:.0} fps")
+                    };
+                    ui.label(egui::RichText::new(label).size(13.0).color(Color32::from_rgb(0xe2, 0xe8, 0xf0)));
+                });
+            }
+            Status::Error(e) => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.colored_label(Color32::from_rgb(0xef, 0x44, 0x44), "⚠️");
+                    ui.label(egui::RichText::new(e).size(13.0).color(Color32::from_rgb(0xef, 0x44, 0x44)));
+                });
+            }
+            Status::Stopped => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    status_dot(ui, Color32::from_rgb(0x8b, 0x8a, 0x96));
+                    ui.label(egui::RichText::new("Parado").size(13.0).color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+                });
+            }
+        }
+    }
+
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let stroke_w = 1.0f32;
+        let margin_x = 20.0f32;
+        let sidebar_w = 300.0f32;
+        let inner_w = sidebar_w - margin_x * 2.0 - stroke_w * 2.0; // 258.0
+
+        let frame = egui::Frame::default()
+            .fill(Color32::from_rgb(0x1a, 0x19, 0x22))
+            .inner_margin(egui::Margin::symmetric(margin_x as i8, 24))
+            .stroke(egui::Stroke::new(stroke_w, Color32::from_rgb(0x31, 0x2f, 0x40)));
+
+        egui::Panel::left("sidebar")
+            .frame(frame)
+            .resizable(false)
+            .exact_size(sidebar_w)
+            .show_inside(ui, |ui| {
+                ui.set_width(inner_w);
+                ui.set_max_width(inner_w);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(inner_w);
+                        ui.set_max_width(inner_w);
+                        self.sidebar_content(ui, inner_w);
+                    });
+            });
+    }
+
+    fn section_header(&self, ui: &mut egui::Ui, icon_char: &str, text: &str) {
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 7.0;
+            if !icon_char.is_empty() {
+                ui.label(
+                    egui::RichText::new(icon_char)
+                        .size(11.0)
+                        .color(Color32::from_rgb(0x8b, 0x8a, 0x96)),
+                );
+            }
+            ui.label(
+                egui::RichText::new(text)
+                    .size(11.0)
+                    .strong()
+                    .color(Color32::from_rgb(0x8b, 0x8a, 0x96)),
+            );
+        });
+        ui.add_space(4.0);
+    }
+
+    fn sidebar_content(&mut self, ui: &mut egui::Ui, inner_w: f32) {
+        let ctx = ui.ctx().clone();
+        let spacing_x = ui.spacing().item_spacing.x;
+        let half_w = ((inner_w - spacing_x) * 0.5).max(40.0);
+
+        // 1. Dispositivo
+        self.section_header(ui, icon::VR_HEADSET, "DISPOSITIVO");
+        let dev_label = self
+            .selected_serial
+            .as_ref()
+            .and_then(|s| self.devices.iter().find(|d| &d.serial == s))
+            .map(|d| d.label_masked(self.streamer_active()))
+            .unwrap_or_else(|| "No device".into());
+
+        let mut changed_device = false;
+        let btn_size = 32.0;
+        let combo_w = (inner_w - btn_size - spacing_x).max(60.0);
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(vec2(combo_w, btn_size), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_max_width(combo_w);
+                let _r = custom_combobox("device")
+                    .selected_text(egui::RichText::new(&dev_label).size(13.0))
+                    .truncate()
+                    .width(combo_w)
                     .show_ui(ui, |ui| {
                         let mask = self.streamer_active();
                         for d in self.devices.iter().filter(|d| d.state == "device") {
-                            if ui
-                                .selectable_label(
+                            if ui.selectable_label(
                                     self.selected_serial.as_deref() == Some(&d.serial),
                                     d.label_masked(mask),
-                                )
-                                .clicked()
+                                ).clicked()
                             {
                                 self.selected_serial = Some(d.serial.clone());
                                 changed_device = true;
                             }
                         }
                     });
-                if ui.button("⟳").on_hover_text("Refresh devices").clicked() {
-                    self.refresh_devices();
-                }
-                if changed_device {
-                    self.request_display_fetch();
-                }
+            });
 
-                ui.separator();
+            let b = ui.add_sized([btn_size, btn_size], egui::Button::new(icon::REFRESH)).on_hover_text("Atualizar Lista");
+            if b.clicked() {
+                self.refresh_devices();
+            }
+        });
+        if changed_device { self.request_display_fetch(); }
 
-                // Display picker.
-                let disp_label = self
-                    .displays
-                    .iter()
-                    .find(|d| d.id == self.settings.display_id)
-                    .map(|d| d.label())
-                    .unwrap_or_else(|| format!("Display {}", self.settings.display_id));
-                egui::ComboBox::from_id_salt("display")
-                    .selected_text(disp_label)
-                    .width(190.0)
+        // 2. Display & Max Size
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(vec2(half_w, 48.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_max_width(half_w);
+                col_header(ui, icon::DISPLAY, "DISPLAY");
+                let disp_label = self.displays.iter().find(|d| d.id == self.settings.display_id)
+                    .map(|d| format!("{} × {}", d.width, d.height))
+                    .unwrap_or_else(|| format!("Disp {}", self.settings.display_id));
+                custom_combobox("display")
+                    .selected_text(egui::RichText::new(disp_label).size(12.0))
+                    .truncate()
+                    .width(half_w)
                     .show_ui(ui, |ui| {
-                        if self.displays.is_empty() {
-                            ui.label("(querying…)");
-                        }
+                        if self.displays.is_empty() { ui.label("(querying…)"); }
                         for d in &self.displays {
-                            ui.selectable_value(&mut self.settings.display_id, d.id, d.label());
+                            ui.selectable_value(&mut self.settings.display_id, d.id, format!("{} × {}", d.width, d.height));
                         }
                     });
-
-                ui.separator();
-
-                // Streamer mode: auto-hides device serials / saved Wi-Fi
-                // addresses while OBS is running; click to override.
-                let (streamer_label, streamer_hover) = match self.streamer_forced {
-                    Some(true) => ("🥷 Streamer: on", "Always hiding serials/IPs — click for auto"),
-                    Some(false) => {
-                        ("🥷 Streamer: off", "Never hiding serials/IPs — click for auto")
-                    }
-                    None if self.obs_detected => (
-                        "🥷 Streamer: auto (OBS open)",
-                        "OBS detected — serials/IPs are hidden. Click to force off.",
-                    ),
-                    None => (
-                        "🥷 Streamer: auto",
-                        "Will hide serials/IPs automatically when OBS is running. Click to force on.",
-                    ),
-                };
-                if ui
-                    .add(egui::Button::selectable(self.streamer_active(), streamer_label))
-                    .on_hover_text(streamer_hover)
-                    .clicked()
-                {
-                    self.streamer_forced = match self.streamer_forced {
-                        None => Some(true),
-                        Some(true) => Some(false),
-                        Some(false) => None,
-                    };
-                }
             });
-
-            // Wireless adb: connect to / remember Quests over the network.
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Wi-Fi:").on_hover_text(
-                    "adb connect a Quest over the network. Enable wireless debugging on \
-                     the headset (or run `adb tcpip 5555` over USB first).",
-                );
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.remote_input)
-                        .hint_text("192.168.x.x[:5555]")
-                        .desired_width(150.0),
-                );
-                let entered =
-                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let clicked = ui
-                    .add_enabled(!self.connecting, egui::Button::new("🔗 Connect"))
-                    .clicked();
-                if (clicked || entered) && !self.remote_input.trim().is_empty() {
-                    let addr = self.remote_input.trim().to_string();
-                    self.remote_input.clear();
-                    self.start_remote_connect(addr, ctx.clone());
-                }
-                if self.connecting {
-                    ui.spinner();
-                }
-
-                if !self.remotes.is_empty() {
-                    ui.separator();
-                    if ui
-                        .add_enabled(!self.connecting, egui::Button::new("Connect all"))
-                        .on_hover_text("adb connect every saved address")
-                        .clicked()
-                    {
-                        self.start_connect_all(ctx.clone());
-                    }
-                    let mut connect_one = None;
-                    let mut forget = None;
-                    let mask = self.streamer_active();
-                    for r in self.remotes.clone() {
-                        let shown = if mask { "•••".to_string() } else { r.clone() };
-                        if ui
-                            .add_enabled(!self.connecting, egui::Button::new(format!("🔗 {shown}")))
-                            .on_hover_text("Reconnect & select")
-                            .clicked()
-                        {
-                            connect_one = Some(r.clone());
-                        }
-                        if ui.small_button("✕").on_hover_text("Forget").clicked() {
-                            forget = Some(r.clone());
-                        }
-                    }
-                    if let Some(r) = connect_one {
-                        self.start_remote_connect(r, ctx.clone());
-                    }
-                    if let Some(r) = forget {
-                        adb::disconnect(&r);
-                        self.remotes.retain(|x| x != &r);
-                    }
-                }
-            });
-
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
-                // Resolution cap.
-                ui.label("Max size:");
-                let size_label = if self.settings.max_size == 0 {
-                    "Full panel".to_string()
-                } else {
-                    format!("{}px", self.settings.max_size)
-                };
-                egui::ComboBox::from_id_salt("maxsize")
-                    .selected_text(size_label)
-                    .width(110.0)
+            ui.allocate_ui_with_layout(vec2(half_w, 48.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_max_width(half_w);
+                col_header(ui, icon::EXPAND, "MAX SIZE");
+                let size_label = if self.settings.max_size == 0 { "Full".to_string() } else { format!("{}px", self.settings.max_size) };
+                custom_combobox("maxsize")
+                    .selected_text(egui::RichText::new(size_label).size(12.0))
+                    .truncate()
+                    .width(half_w)
                     .show_ui(ui, |ui| {
-                        for (val, txt) in [
-                            (0u32, "Full panel"),
-                            (1280, "1280px"),
-                            (1600, "1600px"),
-                            (1920, "1920px"),
-                            (2560, "2560px"),
-                            (3840, "3840px"),
-                        ] {
+                        for (val, txt) in [(0u32, "Full panel"), (1280, "1280px"), (1440, "1440px"), (1600, "1600px"), (1920, "1920px"), (2560, "2560px"), (3840, "3840px")] {
                             ui.selectable_value(&mut self.settings.max_size, val, txt);
                         }
                     });
+            });
+        });
 
-                ui.separator();
-                ui.label("Bitrate:");
-                ui.add(
-                    egui::DragValue::new(&mut self.settings.bitrate_mbps)
-                        .range(2..=80)
-                        .suffix(" Mbps"),
-                );
+        // 3. Streamer
+        self.section_header(ui, icon::STREAMER, "STREAMER");
+        let streamer_label = match self.streamer_forced {
+            Some(true) => "On",
+            Some(false) => "Off",
+            None => "Auto",
+        };
+        custom_combobox("streamer")
+            .selected_text(egui::RichText::new(streamer_label).size(13.0))
+            .truncate()
+            .width(inner_w)
+            .show_ui(ui, |ui| {
+                let auto_txt = if self.obs_detected { "Auto (OBS detectado)" } else { "Auto (baseado no OBS)" };
+                ui.selectable_value(&mut self.streamer_forced, None, auto_txt);
+                ui.selectable_value(&mut self.streamer_forced, Some(true), "On (Ocultar serials/IPs)");
+                ui.selectable_value(&mut self.streamer_forced, Some(false), "Off (Mostrar serials/IPs)");
+            });
 
-                ui.separator();
-                ui.label("FPS:");
-                let fps_label = if self.settings.max_fps == 0 {
-                    "Max".to_string()
-                } else {
-                    self.settings.max_fps.to_string()
-                };
-                egui::ComboBox::from_id_salt("fps")
-                    .selected_text(fps_label)
-                    .width(80.0)
+        if self.stream.is_some() || self.flat.is_some() {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let spout_label = if self.spout_enabled { "OBS (Spout): on" } else { "OBS (Spout)" };
+                if ui.add_sized([half_w, 32.0], egui::Button::selectable(self.spout_enabled, spout_label).truncate()).clicked() {
+                    self.spout_enabled = !self.spout_enabled;
+                    if !self.spout_enabled { self.spout = None; }
+                    self.spout_error = None;
+                }
+                let vcam_label = if self.vcam_enabled { "VCam: on" } else { "VCam" };
+                if ui.add_sized([half_w, 32.0], egui::Button::selectable(self.vcam_enabled, vcam_label).truncate()).clicked() {
+                    self.vcam_enabled = !self.vcam_enabled;
+                    if !self.vcam_enabled { self.vcam = None; }
+                    self.vcam_error = None;
+                }
+            });
+        }
+
+        // 4. Rede
+        self.section_header(ui, icon::WIFI, "REDE (WI-FI)");
+        ui.horizontal(|ui| {
+            let input_btn_w = 32.0;
+            let input_w = (inner_w - input_btn_w - spacing_x).max(60.0);
+            let resp = ui.add_sized(
+                [input_w, 32.0],
+                egui::TextEdit::singleline(&mut self.remote_input).hint_text("192.168.1.x[:5555]"),
+            );
+            let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let b = ui.add_sized([input_btn_w, 32.0], egui::Button::new(icon::LINK));
+            if (b.clicked() || entered) && !self.remote_input.trim().is_empty() {
+                let addr = self.remote_input.trim().to_string();
+                self.remote_input.clear();
+                self.start_remote_connect(addr, ctx.clone());
+            }
+        });
+        
+        if self.connecting {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new("Conectando…").size(12.0).color(Color32::from_rgb(0x8b, 0x5c, 0xf6)));
+            });
+        }
+
+        if !self.remotes.is_empty() {
+            ui.add_space(4.0);
+            if self.remotes.len() > 1 {
+                if ui.add_sized([inner_w, 28.0], egui::Button::new(format!("{} Connect all", icon::LINK))).clicked() {
+                    self.start_connect_all(ctx.clone());
+                }
+                ui.add_space(2.0);
+            }
+            let mask = self.streamer_active();
+            let mut connect_one = None;
+            let mut forget = None;
+            let del_btn_w = 32.0;
+            let rem_btn_w = (inner_w - del_btn_w - spacing_x).max(60.0);
+            for r in self.remotes.clone() {
+                let shown = if mask { "•••".to_string() } else { r.clone() };
+                ui.horizontal(|ui| {
+                    let b1 = ui.add_sized([rem_btn_w, 28.0], egui::Button::new(format!("{} {shown}", icon::LINK)).truncate());
+                    if b1.clicked() {
+                        connect_one = Some(r.clone());
+                    }
+                    let b2 = ui.add_sized([del_btn_w, 28.0], egui::Button::new(icon::XMARK));
+                    if b2.clicked() { forget = Some(r.clone()); }
+                });
+            }
+            if let Some(r) = connect_one { self.start_remote_connect(r, ctx.clone()); }
+            if let Some(r) = forget {
+                adb::disconnect(&r);
+                self.remotes.retain(|x| x != &r);
+            }
+        }
+
+        // 5. Performance (Bitrate & FPS)
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(vec2(half_w, 48.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_max_width(half_w);
+                col_header(ui, icon::BITRATE, "BITRATE");
+                let bitrate_label = format!("{} Mbps", self.settings.bitrate_mbps);
+                custom_combobox("bitrate")
+                    .selected_text(egui::RichText::new(bitrate_label).size(12.0))
+                    .truncate()
+                    .width(half_w)
                     .show_ui(ui, |ui| {
-                        for (val, txt) in [
-                            (0u32, "Max"),
-                            (30, "30"),
-                            (60, "60"),
-                            (72, "72"),
-                            (90, "90"),
-                            (120, "120"),
-                        ] {
+                        for val in [8u32, 12, 16, 20, 24, 30, 40, 50, 60, 80] {
+                            ui.selectable_value(&mut self.settings.bitrate_mbps, val, format!("{val} Mbps"));
+                        }
+                    });
+            });
+            ui.allocate_ui_with_layout(vec2(half_w, 48.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_max_width(half_w);
+                col_header(ui, icon::FPS, "FPS");
+                let fps_label = if self.settings.max_fps == 0 { "Max".to_string() } else { self.settings.max_fps.to_string() };
+                custom_combobox("fps")
+                    .selected_text(egui::RichText::new(fps_label).size(12.0))
+                    .truncate()
+                    .width(half_w)
+                    .show_ui(ui, |ui| {
+                        for (val, txt) in [(0u32, "Max"), (30, "30"), (60, "60"), (72, "72"), (90, "90"), (120, "120")] {
                             ui.selectable_value(&mut self.settings.max_fps, val, txt);
                         }
                     });
-
-                ui.separator();
-                ui.checkbox(&mut self.settings.audio, "🔊 Audio");
             });
-
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Quality preset:");
-                let (ll_size, ll_fps, ll_mbps) = PRESET_LOWLAT;
-                let is_lowlat = self.settings.max_size == ll_size
-                    && self.settings.max_fps == ll_fps
-                    && self.settings.bitrate_mbps == ll_mbps;
-                if ui
-                    .add(egui::Button::selectable(is_lowlat, "⚡ Low-Latency"))
-                    .on_hover_text(format!(
-                        "{}px · {} fps · {} Mbps — fastest encode, minimal pipeline delay",
-                        ll_size, ll_fps, ll_mbps
-                    ))
-                    .clicked()
-                {
-                    self.apply_quality_preset(ll_size, ll_fps, ll_mbps);
-                }
-                let (hq_size, hq_fps, hq_mbps) = PRESET_HIQUAL;
-                let is_hiqual = self.settings.max_size == hq_size
-                    && self.settings.max_fps == hq_fps
-                    && self.settings.bitrate_mbps == hq_mbps;
-                if ui
-                    .add(egui::Button::selectable(is_hiqual, "🎬 High-Quality"))
-                    .on_hover_text(format!(
-                        "{}px · {} fps · {} Mbps — best visual fidelity for OBS recording",
-                        hq_size, hq_fps, hq_mbps
-                    ))
-                    .clicked()
-                {
-                    self.apply_quality_preset(hq_size, hq_fps, hq_mbps);
-                }
-            });
-
-            ui.horizontal(|ui| {
-                let streaming = self.stream.is_some() || self.flat.is_some();
-                if !streaming {
-                    let enabled = self.selected_serial.is_some();
-                    let quest = self.selected_is_quest();
-                    if ui
-                        .add_enabled(enabled, egui::Button::new("▶  Connect"))
-                        .on_hover_text(if quest {
-                            "Live flat view (default for Meta/Quest): whole undistorted view, unrooted"
-                        } else {
-                            "Mirror this device"
-                        })
-                        .clicked()
-                    {
-                        if quest {
-                            self.connect_flat(&ctx);
-                        } else {
-                            self.connect(&ctx);
-                        }
-                    }
-                    // Escape hatch for Quest: the raw panel mirror (stereo, lens-
-                    // warped) with the crop/flatten tools.
-                    if quest
-                        && ui
-                            .add_enabled(enabled, egui::Button::new("▶ Panel view"))
-                            .on_hover_text("Connect as raw panel mirror (stereo, lens-warped) — use the crop / flatten tools below to extract a single eye")
-                            .clicked()
-                    {
-                        self.connect(&ctx);
-                    }
-                } else {
-                    if ui.button("■  Disconnect").clicked() {
-                        self.disconnect();
-                    }
-                    if (self.stream.is_some() || self.flat.is_some())
-                        && !self.active_config_matches()
-                        && ui
-                            .button("⟳  Apply settings")
-                            .on_hover_text("Reconnect with the new settings")
-                            .clicked()
-                    {
-                        if self.flat.is_some() {
-                            self.connect_flat(&ctx);
-                        } else {
-                            self.connect(&ctx);
-                        }
-                    }
-                }
-
-                // Auto-reconnect toggle — only relevant for the Panel view (scrcpy path).
-                // Flat view has its own unconditional reconnect loop.
-                if self.stream.is_some() {
-                    ui.separator();
-                    let changed = ui
-                        .checkbox(&mut self.auto_reconnect, "🔁 Auto-reconnect")
-                        .on_hover_text(
-                            "When enabled, the Panel view reconnects automatically after a Wi-Fi drop.\n\
-                             Disable to get a manual error instead.",
-                        )
-                        .changed();
-                    if changed {
-                        self.sync_auto_reconnect();
-                    }
-                }
-
-                ui.separator();
-                self.status_label(ui);
-
-                // Capture controls — work for either source (panel or flat view).
-                if self.stream.is_some() || self.flat.is_some() {
-                    ui.separator();
-                    let can_shoot = self.texture.is_some();
-                    if ui
-                        .add_enabled(can_shoot, egui::Button::new("📷 Screenshot"))
-                        .on_hover_text("Save the current crop as a PNG")
-                        .clicked()
-                    {
-                        self.take_screenshot();
-                    }
-                    let recording = self.stream.as_ref().map(|s| s.is_recording()).unwrap_or(false)
-                        || self.flat.as_ref().map(|f| f.is_recording()).unwrap_or(false);
-                    let (label, color) = if recording {
-                        ("⏹ Stop", Color32::from_rgb(0xff, 0x6b, 0x6b))
-                    } else {
-                        ("⏺ Record", Color32::from_rgb(0xff, 0xc4, 0x4c))
-                    };
-                    if ui
-                        .add(egui::Button::new(egui::RichText::new(label).color(color)))
-                        .on_hover_text("Record the full stream to an .mp4 clip")
-                        .clicked()
-                    {
-                        self.toggle_recording();
-                    }
-
-                    let spout_label = if self.spout_enabled { "📡 OBS: on" } else { "📡 OBS" };
-                    if ui
-                        .add(egui::Button::selectable(self.spout_enabled, spout_label))
-                        .on_hover_text(
-                            "Expose this view as a Spout2 source — add \"Quest scrcpy\" \
-                             in OBS via the Spout2 Plugin",
-                        )
-                        .clicked()
-                    {
-                        self.spout_enabled = !self.spout_enabled;
-                        if !self.spout_enabled {
-                            self.spout = None;
-                        }
-                        self.spout_error = None;
-                    }
-
-                    let vcam_label = if self.vcam_enabled { "🎥 Virtual cam: on" } else { "🎥 Virtual cam" };
-                    if ui
-                        .add(egui::Button::selectable(self.vcam_enabled, vcam_label))
-                        .on_hover_text(
-                            "Expose this view as a system webcam (via the OBS Virtual \
-                             Camera device) — usable in Zoom, Discord, browsers, or as a \
-                             Video Capture Device source in OBS. Requires OBS installed \
-                             (not necessarily running), and can't run at the same time as \
-                             OBS's own \"Start Virtual Camera\".",
-                        )
-                        .clicked()
-                    {
-                        self.vcam_enabled = !self.vcam_enabled;
-                        if !self.vcam_enabled {
-                            self.vcam = None;
-                        }
-                        self.vcam_error = None;
-                    }
-                }
-            });
-
-            if let Some(msg) = &self.capture_msg {
-                ui.add_space(2.0);
-                ui.label(egui::RichText::new(msg).weak().small());
-            }
-            if let Some(err) = &self.spout_error {
-                ui.add_space(2.0);
-                ui.colored_label(
-                    Color32::from_rgb(0xff, 0x6b, 0x6b),
-                    format!("Spout: {err}"),
-                );
-            }
-            if let Some(err) = &self.vcam_error {
-                ui.add_space(2.0);
-                ui.colored_label(
-                    Color32::from_rgb(0xff, 0x6b, 0x6b),
-                    format!("Virtual cam: {err}"),
-                );
-            }
-            ui.add_space(4.0);
         });
-    }
 
-    fn status_label(&self, ui: &mut egui::Ui) {
-        let status = if let Some(f) = &self.flat {
-            f.status()
-        } else if let Some(s) = &self.stream {
-            s.status()
+        // 6. Áudio
+        ui.add_space(16.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 7.0;
+            ui.label(egui::RichText::new(icon::AUDIO).size(11.0).color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+            ui.label(egui::RichText::new("ÁUDIO").size(11.0).strong().color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                toggle_switch(ui, &mut self.settings.audio);
+            });
+        });
+
+        // 7. Quality Presets
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("QUALITY PRESET").size(11.0).strong().color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+        ui.add_space(6.0);
+        
+        ui.horizontal(|ui| {
+            let (ll_size, ll_fps, ll_mbps) = PRESET_LOWLAT;
+            let is_lowlat = self.settings.max_size == ll_size && self.settings.max_fps == ll_fps && self.settings.bitrate_mbps == ll_mbps;
+            let (hq_size, hq_fps, hq_mbps) = PRESET_HIQUAL;
+            let is_hiqual = self.settings.max_size == hq_size && self.settings.max_fps == hq_fps && self.settings.bitrate_mbps == hq_mbps;
+
+            if preset_button(ui, [half_w, 32.0], is_lowlat, icon::BOLT, "Low-Latency").clicked() {
+                self.apply_quality_preset(ll_size, ll_fps, ll_mbps);
+            }
+            if preset_button(ui, [half_w, 32.0], is_hiqual, icon::GEM, "High-Quality").clicked() {
+                self.apply_quality_preset(hq_size, hq_fps, hq_mbps);
+            }
+        });
+
+        // 8. Botões de Ação Principais
+        ui.add_space(18.0);
+
+        let streaming = self.stream.is_some() || self.flat.is_some();
+
+        if !streaming {
+            let enabled = self.selected_serial.is_some();
+            let quest = self.selected_is_quest();
+
+            let connect_btn = egui::Button::new(
+                egui::RichText::new(format!("{}  Connect", icon::PLAY))
+                    .strong()
+                    .size(13.5)
+                    .color(Color32::WHITE),
+            )
+            .fill(Color32::from_rgb(0x8b, 0x5c, 0xf6))
+            .corner_radius(egui::CornerRadius::same(8));
+
+            if ui.add_sized([inner_w, 42.0], connect_btn).clicked() && enabled {
+                if quest { self.connect_flat(&ctx); } else { self.connect(&ctx); }
+            }
+
+            if quest {
+                ui.add_space(8.0);
+                let panel_btn = egui::Button::new(
+                    egui::RichText::new(format!("{}  Panel view", icon::PLAY))
+                        .size(13.0)
+                        .strong()
+                        .color(Color32::from_rgb(0xe2, 0xe8, 0xf0)),
+                )
+                .fill(Color32::from_rgb(0x20, 0x1f, 0x2b))
+                .stroke(egui::Stroke::new(1.0f32, Color32::from_rgb(0x31, 0x2f, 0x40)))
+                .corner_radius(egui::CornerRadius::same(8));
+
+                if ui.add_sized([inner_w, 38.0], panel_btn).clicked() && enabled {
+                    self.connect(&ctx);
+                }
+            }
         } else {
-            ui.label("Idle");
-            return;
-        };
-        match status {
-            Status::Connecting => {
-                ui.spinner();
-                ui.label("Connecting…");
+            let disconnect_btn = egui::Button::new(
+                egui::RichText::new(format!("{}  Disconnect", icon::STOP))
+                    .strong()
+                    .size(13.5)
+                    .color(Color32::WHITE),
+            )
+            .fill(Color32::from_rgb(0xdc, 0x26, 0x26))
+            .corner_radius(egui::CornerRadius::same(8));
+
+            if ui.add_sized([inner_w, 42.0], disconnect_btn).clicked() {
+                self.disconnect();
             }
-            Status::Streaming { width, height, fps, decode_ms } => {
-                let label = if decode_ms > 0.1 {
-                    format!("🟢 {width}×{height}  ·  {fps:.1} fps  ·  decode: {decode_ms:.1} ms")
-                } else {
-                    format!("🟢 {width}×{height}  ·  {fps:.1} fps")
-                };
-                ui.colored_label(Color32::from_rgb(0x4c, 0xd9, 0x6a), label);
+
+            if !self.active_config_matches() {
+                ui.add_space(8.0);
+                let apply_btn = egui::Button::new(
+                    egui::RichText::new(format!("{}  Apply settings", icon::REFRESH))
+                        .size(13.0)
+                        .color(Color32::WHITE),
+                )
+                .fill(Color32::from_rgb(0x3b, 0x82, 0xf6))
+                .corner_radius(egui::CornerRadius::same(8));
+
+                if ui.add_sized([inner_w, 36.0], apply_btn).clicked() {
+                    if self.flat.is_some() { self.connect_flat(&ctx); } else { self.connect(&ctx); }
+                }
             }
-            Status::Error(e) => {
-                ui.colored_label(Color32::from_rgb(0xff, 0x6b, 0x6b), format!("⚠ {e}"));
-            }
-            Status::Stopped => {
-                ui.label("Stopped");
-            }
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let can_shoot = self.texture.is_some();
+                if ui.add_sized([(inner_w - 8.0) * 0.5, 36.0], egui::Button::new(format!("{}  Screenshot", icon::CAMERA))).clicked() && can_shoot {
+                    self.take_screenshot();
+                }
+
+                let recording = self.stream.as_ref().map(|s| s.is_recording()).unwrap_or(false)
+                    || self.flat.as_ref().map(|f| f.is_recording()).unwrap_or(false);
+                let (label, color) = if recording { (format!("{}  Stop", icon::STOP), Color32::from_rgb(0xff, 0x6b, 0x6b)) } else { (format!("{}  Record", icon::VIDEO), Color32::from_rgb(0xff, 0xc4, 0x4c)) };
+                if ui.add_sized([(inner_w - 8.0) * 0.5, 36.0], egui::Button::new(egui::RichText::new(label).color(color))).clicked() {
+                    self.toggle_recording();
+                }
+            });
+        }
+        
+        if let Some(msg) = &self.capture_msg {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(msg).size(12.0).color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
         }
     }
 
-    fn bottom_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("cropbar").show_inside(ui, |ui| {
-            ui.add_space(3.0);
-            // The crop / zoom / lens / tilt tools apply to the raw (stereo, lens-warped)
-            // panel mirror. They are always visible when NOT in flat mode so the user
-            // can pre-configure crop / k1 / k2 / tilt before connecting.
-            // In flat mode the device already composites a flat, undistorted view — hide them.
-            if self.flat.is_some() {
-                ui.label(
-                    egui::RichText::new(
-                        "🥽 Flat view — whole undistorted stream (crop / lens / tilt not needed)",
-                    )
-                    .weak(),
-                );
-                ui.add_space(3.0);
-                return;
-            }
-            ui.horizontal_wrapped(|ui| {
-                // One-click "good Quest 3 view": left eye + lens flattened + level.
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new("🥽 Quest 3").strong(),
-                    ))
-                    .on_hover_text("Apply the solid Quest 3 preset: left eye, lens flattened, no tilt")
-                    .clicked()
-                {
-                    self.apply_quest3_preset();
-                }
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new("🥽 Quest 3S").strong(),
-                    ))
-                    .on_hover_text("Apply the Quest 3S preset: left eye, fresnel lens correction (moderate)")
-                    .clicked()
-                {
-                    self.apply_quest3s_preset();
-                }
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new("🥽 Quest 2").strong(),
-                    ))
-                    .on_hover_text("Apply the Quest 2 preset: left eye, stronger barrel lens correction")
-                    .clicked()
-                {
-                    self.apply_quest2_preset();
-                }
-                if ui
-                    .add(egui::Button::new(
-                        egui::RichText::new("🥽 Quest Pro").strong(),
-                    ))
-                    .on_hover_text("Apply the Quest Pro preset: left eye, pancake lens (minimal correction)")
-                    .clicked()
-                {
-                    self.apply_questpro_preset();
-                }
-                ui.separator();
-                ui.label("Crop:");
-                if ui.button("Left eye").clicked() {
-                    self.uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(0.5, 1.0));
-                }
-                if ui.button("Right eye").clicked() {
-                    self.uv = Rect::from_min_max(pos2(0.5, 0.0), pos2(1.0, 1.0));
-                }
-                if ui.button("Full panel").clicked() {
-                    self.uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-                }
-                if ui.button("Center 50%").clicked() {
-                    self.uv = Rect::from_min_max(pos2(0.25, 0.25), pos2(0.75, 0.75));
-                }
-                ui.separator();
-                // Zoom slider acts on the crop size around its centre.
-                let mut zoom = 1.0 / self.uv.width().max(1e-3);
-                if ui
-                    .add(egui::Slider::new(&mut zoom, 1.0..=8.0).text("zoom"))
-                    .changed()
-                {
-                    let center = self.uv.center();
-                    let half = (0.5 / zoom).min(0.5);
-                    let half_h = half; // keep square-ish in uv; aspect handled at draw
-                    self.uv = clamp_uv(Rect::from_center_size(
-                        center,
-                        vec2(half * 2.0, half_h * 2.0),
-                    ));
-                }
-                ui.label("· drag to pan, scroll to zoom");
-            });
-
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut self.lens_correct, "Flatten lens")
-                    .on_hover_text("Undo the Quest's lens (fisheye) distortion for a flat 2D view");
-                ui.add_enabled_ui(self.lens_correct, |ui| {
-                    ui.add(
-                        egui::Slider::new(&mut self.lens_k1, -0.8..=0.8)
-                            .text("curve")
-                            .fixed_decimals(2),
-                    )
-                    .on_hover_text("Main distortion: drag until straight lines look straight");
-                    ui.add(
-                        egui::Slider::new(&mut self.lens_k2, -0.4..=0.4)
-                            .text("edge")
-                            .fixed_decimals(2),
-                    )
-                    .on_hover_text("Fine correction near the edges");
-                });
-                ui.separator();
-                ui.add(
-                    egui::Slider::new(&mut self.rotation_deg, -45.0..=45.0)
-                        .text("tilt°")
-                        .fixed_decimals(1),
-                )
-                .on_hover_text("Rotate to straighten an inclined view");
-                if ui.button("Reset").clicked() {
-                    self.lens_k1 = QUEST3_K1;
-                    self.lens_k2 = QUEST3_K2;
-                    self.rotation_deg = QUEST3_TILT;
-                }
-            });
-            ui.add_space(3.0);
-        });
-    }
-
     fn central_video(&mut self, ui: &mut egui::Ui) {
-        let Some(texture) = self.texture.clone() else {
-            ui.centered_and_justified(|ui| {
+        let frame = egui::Frame::default()
+            .fill(Color32::from_rgb(0x14, 0x13, 0x1a))
+            .inner_margin(egui::Margin::ZERO);
+        egui::CentralPanel::default().frame(frame).show_inside(ui, |ui| {
+            let Some(texture) = self.texture.clone() else {
+                let area = ui.available_rect_before_wrap();
+                let painter = ui.painter_at(area);
+                painter.rect_filled(area, 0.0, Color32::from_rgb(0x14, 0x13, 0x1a));
+
+            ui.vertical_centered(|ui| {
+                let avail_h = ui.available_height();
+                let content_h = 320.0;
+                if avail_h > content_h { ui.add_space((avail_h - content_h) * 0.4); }
+
+                let (headset_rect, _) = ui.allocate_exact_size(vec2(200.0, 110.0), Sense::hover());
+                draw_headset_graphic(&ui.painter(), headset_rect.center());
+                ui.add_space(28.0);
+
                 let msg = if self.stream.is_some() || self.flat.is_some() {
-                    "Waiting for first frame…"
+                    "Aguardando primeiro frame…"
                 } else {
                     "Pick your Quest and hit Connect."
                 };
-                ui.label(egui::RichText::new(msg).size(16.0).weak());
+                ui.label(egui::RichText::new(msg).size(22.0).strong().color(Color32::from_rgb(0xe2, 0xe8, 0xf0)));
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Aguardando seleção de dispositivo para iniciar o stream.").size(14.0).color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+                ui.add_space(24.0);
+
+                let streaming = self.stream.is_some() || self.flat.is_some();
+                let enabled = self.selected_serial.is_some() && !streaming;
+                let quest = self.selected_is_quest();
+                
+                let btn = egui::Button::new(
+                    egui::RichText::new(format!("{}  Connect", icon::PLAY))
+                        .strong()
+                        .size(14.0)
+                        .color(Color32::WHITE),
+                ).fill(Color32::from_rgb(0x8b, 0x5c, 0xf6)).corner_radius(egui::CornerRadius::same(6));
+
+                if ui.add_sized([160.0, 44.0], btn).clicked() && enabled {
+                    let ctx = ui.ctx().clone();
+                    if quest { self.connect_flat(&ctx); } else { self.connect(&ctx); }
+                }
             });
             return;
         };
 
-            let area = ui.available_rect_before_wrap();
-            let response = ui.allocate_rect(area, Sense::click_and_drag());
-            let painter = ui.painter_at(area);
+        let area = ui.available_rect_before_wrap();
+        let response = ui.allocate_rect(area, Sense::click_and_drag());
+        let painter = ui.painter_at(area);
 
-            let tex_w = self.tex_size[0] as f32;
-            let tex_h = self.tex_size[1] as f32;
-            let crop_w_px = self.uv.width() * tex_w;
-            let crop_h_px = self.uv.height() * tex_h;
-            let crop_aspect = (crop_w_px / crop_h_px).max(1e-3);
-            let area_aspect = area.width() / area.height().max(1.0);
+        let tex_w = self.tex_size[0] as f32;
+        let tex_h = self.tex_size[1] as f32;
+        let crop_w_px = self.uv.width() * tex_w;
+        let crop_h_px = self.uv.height() * tex_h;
+        let crop_aspect = (crop_w_px / crop_h_px).max(1e-3);
+        let area_aspect = area.width() / area.height().max(1.0);
 
-            let draw_size = if area_aspect > crop_aspect {
-                vec2(area.height() * crop_aspect, area.height())
-            } else {
-                vec2(area.width(), area.width() / crop_aspect)
-            };
-            let draw_rect = Rect::from_center_size(area.center(), draw_size);
+        let draw_size = if area_aspect > crop_aspect {
+            vec2(area.height() * crop_aspect, area.height())
+        } else {
+            vec2(area.width(), area.width() / crop_aspect)
+        };
+        let draw_rect = Rect::from_center_size(area.center(), draw_size);
 
-            painter.rect_filled(area, 0.0, Color32::from_gray(12));
-            if self.lens_correct || self.rotation_deg.abs() > 0.01 {
-                let (k1, k2) = if self.lens_correct {
-                    (self.lens_k1, self.lens_k2)
-                } else {
-                    (0.0, 0.0)
-                };
-                draw_warped(&painter, texture.id(), draw_rect, self.uv, k1, k2, self.rotation_deg);
-            } else {
-                painter.image(texture.id(), draw_rect, self.uv, Color32::WHITE);
-            }
+        painter.rect_filled(area, 0.0, Color32::from_rgb(0x14, 0x13, 0x1a));
+        if self.lens_correct || self.rotation_deg.abs() > 0.01 {
+            let (k1, k2) = if self.lens_correct { (self.lens_k1, self.lens_k2) } else { (0.0, 0.0) };
+            draw_warped(&painter, texture.id(), draw_rect, self.uv, k1, k2, self.rotation_deg);
+        } else {
+            painter.image(texture.id(), draw_rect, self.uv, Color32::WHITE);
+        }
 
-            // Drag to pan.
-            if response.dragged() {
-                let d = response.drag_delta();
-                let uv_dx = -d.x / draw_size.x * self.uv.width();
-                let uv_dy = -d.y / draw_size.y * self.uv.height();
-                self.uv = clamp_uv(self.uv.translate(vec2(uv_dx, uv_dy)));
-            }
+        if response.dragged() {
+            let d = response.drag_delta();
+            let uv_dx = -d.x / draw_size.x * self.uv.width();
+            let uv_dy = -d.y / draw_size.y * self.uv.height();
+            self.uv = clamp_uv(self.uv.translate(vec2(uv_dx, uv_dy)));
+        }
 
-            // Scroll to zoom around the cursor.
-            if response.hovered() {
-                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll.abs() > 0.1 {
-                    if let Some(pos) = response.hover_pos() {
-                        let factor = (1.0 - scroll * 0.0015).clamp(0.5, 1.5);
-                        let cursor_uv = screen_to_uv(pos, draw_rect, self.uv);
-                        self.uv = clamp_uv(scale_about(self.uv, cursor_uv, factor));
-                    }
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.1 {
+                if let Some(pos) = response.hover_pos() {
+                    let factor = (1.0 - scroll * 0.0015).clamp(0.5, 1.5);
+                    let cursor_uv = screen_to_uv(pos, draw_rect, self.uv);
+                    self.uv = clamp_uv(scale_about(self.uv, cursor_uv, factor));
                 }
             }
+        }
+        });
+    }
+
+    fn settings_modal(&mut self, ctx: &egui::Context) {
+        if !self.settings_open { return; }
+        
+        let mut close_requested = false;
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close_requested = true;
+        }
+
+        let screen_rect = ctx.content_rect();
+        egui::Area::new(egui::Id::new("settings_backdrop_area"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen_rect.min)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen_rect.size(), egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(160));
+                if resp.clicked() {
+                    close_requested = true;
+                }
+            });
+
+        let frame = egui::Frame::window(&ctx.global_style())
+            .fill(Color32::from_rgb(0x1a, 0x19, 0x22))
+            .stroke(egui::Stroke::new(1.0f32, Color32::from_rgb(0x31, 0x2f, 0x40)))
+            .inner_margin(egui::Margin::same(24));
+
+        egui::Window::new("Advanced Panel View Settings")
+            .title_bar(false) // Custom title bar for flat look
+            .frame(frame)
+            .collapsible(false)
+            .resizable(false)
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                // Custom Header
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{}  Advanced Panel View Settings", icon::GEAR))
+                            .size(16.0)
+                            .strong()
+                            .color(Color32::from_rgb(0xe2, 0xe8, 0xf0)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let close_btn = egui::Button::new(
+                            egui::RichText::new(icon::XMARK)
+                                .size(14.0)
+                                .color(Color32::from_rgb(0x8b, 0x8a, 0x96)),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE);
+
+                        if ui.add(close_btn).on_hover_text("Fechar (Esc)").clicked() {
+                            close_requested = true;
+                        }
+                    });
+                });
+                
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(16.0);
+
+                // Section 1: Presets
+                ui.label(egui::RichText::new("LENS CALIBRATION PRESETS").size(11.0).strong().color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+                ui.add_space(6.0);
+                let avail_w = ui.available_width();
+                let btn_w = (avail_w - 3.0 * 8.0) * 0.25;
+
+                ui.horizontal(|ui| {
+                    if ui.add_sized([btn_w, 36.0], egui::Button::new("Quest 3")).clicked() { self.apply_quest3_preset(); }
+                    if ui.add_sized([btn_w, 36.0], egui::Button::new("Quest 3S")).clicked() { self.apply_quest3s_preset(); }
+                    if ui.add_sized([btn_w, 36.0], egui::Button::new("Quest 2")).clicked() { self.apply_quest2_preset(); }
+                    if ui.add_sized([btn_w, 36.0], egui::Button::new("Pro")).clicked() { self.apply_questpro_preset(); }
+                });
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(16.0);
+
+                // Section 2: Crop
+                ui.label(egui::RichText::new("CROP (CORTE DA LENTE)").size(11.0).strong().color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+                ui.add_space(6.0);
+
+                let is_left = (self.uv.min.x - 0.0).abs() < 1e-3 && (self.uv.max.x - 0.5).abs() < 1e-3;
+                let is_right = (self.uv.min.x - 0.5).abs() < 1e-3 && (self.uv.max.x - 1.0).abs() < 1e-3;
+                let is_full = (self.uv.min.x - 0.0).abs() < 1e-3 && (self.uv.max.x - 1.0).abs() < 1e-3;
+                let is_center = (self.uv.min.x - 0.25).abs() < 1e-3 && (self.uv.max.x - 0.75).abs() < 1e-3;
+
+                ui.horizontal(|ui| {
+                    if ui.add_sized([btn_w, 36.0], egui::Button::selectable(is_left, "Left eye")).clicked() {
+                        self.uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(0.5, 1.0));
+                    }
+                    if ui.add_sized([btn_w, 36.0], egui::Button::selectable(is_right, "Right eye")).clicked() {
+                        self.uv = Rect::from_min_max(pos2(0.5, 0.0), pos2(1.0, 1.0));
+                    }
+                    if ui.add_sized([btn_w, 36.0], egui::Button::selectable(is_full, "Full panel")).clicked() {
+                        self.uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                    }
+                    if ui.add_sized([btn_w, 36.0], egui::Button::selectable(is_center, "Center 50%")).clicked() {
+                        self.uv = Rect::from_min_max(pos2(0.25, 0.25), pos2(0.75, 0.75));
+                    }
+                });
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(16.0);
+
+                // Section 3: Lens Distortion
+                ui.columns(2, |cols| {
+                    cols[0].checkbox(&mut self.lens_correct, "Flatten lens");
+                    cols[0].add_space(8.0);
+                    cols[0].add_enabled_ui(self.lens_correct, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Curve").color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.monospace(format!("{:.2}", self.lens_k1));
+                            });
+                        });
+                        ui.add(egui::Slider::new(&mut self.lens_k1, -0.8..=0.8).show_value(false));
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Edge").color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.monospace(format!("{:.2}", self.lens_k2));
+                            });
+                        });
+                        ui.add(egui::Slider::new(&mut self.lens_k2, -0.4..=0.4).show_value(false));
+                    });
+
+                    cols[1].horizontal(|ui| {
+                        ui.label(egui::RichText::new("Tilt").color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.monospace(format!("{:.1}°", self.rotation_deg));
+                        });
+                    });
+                    cols[1].add(egui::Slider::new(&mut self.rotation_deg, -45.0..=45.0).show_value(false));
+
+                    cols[1].add_space(8.0);
+                    let mut zoom = 1.0 / self.uv.width().max(1e-3);
+                    cols[1].horizontal(|ui| {
+                        ui.label(egui::RichText::new("Zoom").color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.monospace(format!("{:.2}x", zoom));
+                        });
+                    });
+                    if cols[1].add(egui::Slider::new(&mut zoom, 1.0..=8.0).show_value(false)).changed() {
+                        let center = self.uv.center();
+                        let half = (0.5 / zoom).min(0.5);
+                        self.uv = clamp_uv(Rect::from_center_size(center, vec2(half * 2.0, half * 2.0)));
+                    }
+
+                    cols[1].add_space(8.0);
+                    cols[1].label(egui::RichText::new("🖱 Drag to pan, scroll to zoom no painel principal").size(11.0).color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+                });
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                // Section 4: Opções Gerais
+                ui.label(egui::RichText::new("OPÇÕES GERAIS").size(11.0).strong().color(Color32::from_rgb(0x8b, 0x8a, 0x96)));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Auto-reconnect (reconectar automaticamente)").color(Color32::from_rgb(0xe2, 0xe8, 0xf0)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if toggle_switch(ui, &mut self.auto_reconnect).changed() {
+                            self.sync_auto_reconnect();
+                        }
+                    });
+                });
+
+                ui.add_space(20.0);
+
+                // Footer
+                ui.horizontal(|ui| {
+                    if ui.button("⟳ Reset Default").clicked() {
+                        self.lens_k1 = QUEST3_K1;
+                        self.lens_k2 = QUEST3_K2;
+                        self.rotation_deg = QUEST3_TILT;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let close_btn = egui::Button::new(
+                            egui::RichText::new("Apply & Close")
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(0x8b, 0x5c, 0xf6))
+                        .corner_radius(egui::CornerRadius::same(6));
+
+                        if ui.add_sized([120.0, 36.0], close_btn).clicked() {
+                            close_requested = true;
+                        }
+                    });
+                });
+            });
+
+        if close_requested {
+            self.settings_open = false;
+        }
     }
 }
 
-/// Add a monochrome emoji font (bundled Noto Emoji) as a fallback so the UI's
-/// 🥽🔊📷⏺🔗 glyphs render — egui's built-in font only covers a tiny icon
-/// subset, and color fonts (Segoe UI Emoji) don't render in egui's rasterizer.
-fn install_emoji_font(ctx: &egui::Context) {
+fn draw_headset_graphic(painter: &egui::Painter, center: Pos2) {
+    let top_tab = Rect::from_min_max(center - vec2(16.0, 56.0), center + vec2(16.0, -48.0));
+    painter.rect_filled(top_tab, egui::CornerRadius::same(4), Color32::from_rgb(0x23, 0x21, 0x2f));
+
+    let strap_l = Rect::from_min_max(center - vec2(104.0, 9.0), center - vec2(84.0, -9.0));
+    painter.rect_filled(strap_l, egui::CornerRadius::same(5), Color32::from_rgb(0x28, 0x26, 0x36));
+    let strap_r = Rect::from_min_max(center + vec2(84.0, -9.0), center + vec2(104.0, 9.0));
+    painter.rect_filled(strap_r, egui::CornerRadius::same(5), Color32::from_rgb(0x28, 0x26, 0x36));
+
+    let body_rect = Rect::from_center_size(center, vec2(174.0, 102.0));
+    painter.rect(
+        body_rect,
+        egui::CornerRadius::same(34),
+        Color32::from_rgb(0x1d, 0x1b, 0x27),
+        egui::Stroke::new(2.0f32, Color32::from_rgb(0x31, 0x2f, 0x40)),
+        egui::StrokeKind::Middle,
+    );
+
+    let plate_rect = Rect::from_center_size(center, vec2(154.0, 84.0));
+    painter.rect(
+        plate_rect,
+        egui::CornerRadius::same(26),
+        Color32::from_rgb(0x13, 0x12, 0x19),
+        egui::Stroke::new(1.0f32, Color32::from_rgb(0x28, 0x26, 0x36)),
+        egui::StrokeKind::Middle,
+    );
+
+    for &dx in &[-40.0f32, 0.0f32, 40.0f32] {
+        let pill_center = center + vec2(dx, 0.0);
+        let pill_rect = Rect::from_center_size(pill_center, vec2(20.0, 46.0));
+
+        painter.rect(
+            pill_rect,
+            egui::CornerRadius::same(10),
+            Color32::from_rgb(0x0c, 0x0b, 0x11),
+            egui::Stroke::new(1.5f32, Color32::from_rgb(0x36, 0x33, 0x47)),
+            egui::StrokeKind::Middle,
+        );
+
+        painter.rect_stroke(
+            pill_rect.shrink(1.0),
+            egui::CornerRadius::same(9),
+            egui::Stroke::new(1.0f32, Color32::from_rgba_unmultiplied(139, 92, 246, 70)),
+            egui::StrokeKind::Middle,
+        );
+
+        let top_lens = pill_center - vec2(0.0, 10.0);
+        painter.circle(top_lens, 6.0, Color32::from_rgb(0x16, 0x13, 0x22), egui::Stroke::new(1.2f32, Color32::from_rgb(0x8b, 0x5c, 0xf6)));
+        painter.circle_filled(top_lens, 3.2, Color32::from_rgb(0x23, 0x1c, 0x35));
+        painter.circle_filled(top_lens + vec2(1.6, -1.6), 1.3, Color32::from_rgba_unmultiplied(255, 255, 255, 220));
+
+        let bot_lens = pill_center + vec2(0.0, 10.0);
+        painter.circle(bot_lens, 5.0, Color32::from_rgb(0x11, 0x0f, 0x18), egui::Stroke::new(1.0f32, Color32::from_rgb(0x63, 0x55, 0x88)));
+        painter.circle_filled(bot_lens, 2.5, Color32::from_rgb(0x1d, 0x18, 0x29));
+        painter.circle_filled(bot_lens + vec2(1.2, -1.2), 1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 160));
+    }
+
+    let led_pos = center + vec2(62.0, -28.0);
+    painter.circle_filled(led_pos, 2.2, Color32::from_rgb(0x22, 0xc5, 0x5e));
+    painter.circle(led_pos, 4.0, Color32::TRANSPARENT, egui::Stroke::new(1.0f32, Color32::from_rgba_unmultiplied(34, 197, 94, 90)));
+}
+
+fn install_custom_fonts(ctx: &egui::Context) {
     const NOTO_EMOJI: &[u8] = include_bytes!("../assets/NotoEmoji-Regular.ttf");
+    const FA_SOLID: &[u8] = include_bytes!("../assets/fa-solid-900.ttf");
     let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("noto_emoji".to_owned(), Arc::new(egui::FontData::from_static(NOTO_EMOJI)));
+    fonts.font_data.insert("fa_solid".to_owned(), Arc::new(egui::FontData::from_static(FA_SOLID)));
+    fonts.font_data.insert("noto_emoji".to_owned(), Arc::new(egui::FontData::from_static(NOTO_EMOJI)));
     for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(fam).or_default().push("noto_emoji".to_owned());
+        let family = fonts.families.entry(fam).or_default();
+        family.push("fa_solid".to_owned());
+        family.push("noto_emoji".to_owned());
     }
     ctx.set_fonts(fonts);
 }
 
-/// `captures/` folder next to the executable (created on demand).
 fn capture_dir() -> std::io::Result<PathBuf> {
     let base = std::env::current_exe()
         .ok()
@@ -1381,23 +1671,16 @@ fn capture_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// A timestamped path like `captures/clip_1718000000.mp4`.
 fn capture_path(prefix: &str, ext: &str) -> std::io::Result<PathBuf> {
     let dir = capture_dir()?;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     Ok(dir.join(format!("{prefix}_{ts}.{ext}")))
 }
 
-/// Crop the current frame to the visible `uv` window and save it as PNG.
 fn save_crop_png(frame: &Frame, uv: Rect) -> anyhow::Result<PathBuf> {
     let w = frame.width as usize;
     let h = frame.height as usize;
-    if w == 0 || h == 0 {
-        anyhow::bail!("empty frame");
-    }
+    if w == 0 || h == 0 { anyhow::bail!("empty frame"); }
     let wi = w as f32;
     let hi = h as f32;
     let x0 = (uv.min.x * wi).floor().clamp(0.0, wi - 1.0) as usize;
@@ -1421,14 +1704,6 @@ fn save_crop_png(frame: &Frame, uv: Rect) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-/// Draw the cropped texture through a tessellated mesh that (a) undoes the
-/// Quest's radial lens distortion and (b) applies an in-plane rotation, turning
-/// the fisheye VR view into a flat, upright 2D image.
-///
-/// For each grid point we treat `(ox, oy) ∈ [-1,1]²` as the *undistorted* output
-/// position; the matching source sample sits at radius scaled by
-/// `1 + k1·r² + k2·r⁴`, and the on-screen position is that point rotated rigidly
-/// about the centre.
 fn draw_warped(
     painter: &egui::Painter,
     tex: egui::TextureId,
@@ -1439,7 +1714,7 @@ fn draw_warped(
     rot_deg: f32,
 ) {
     use egui::epaint::{Mesh, Vertex};
-    const N: usize = 48; // grid cells per axis
+    const N: usize = 48; 
 
     let (sin, cos) = rot_deg.to_radians().sin_cos();
     let center = rect.center();
@@ -1454,7 +1729,6 @@ fn draw_warped(
             let ox = fx * 2.0 - 1.0;
             let oy = fy * 2.0 - 1.0;
 
-            // Radial remap: where to sample the distorted source for this output.
             let r2 = ox * ox + oy * oy;
             let f = 1.0 + k1 * r2 + k2 * r2 * r2;
             let sx = (0.5 + 0.5 * ox * f).clamp(0.0, 1.0);
@@ -1462,7 +1736,6 @@ fn draw_warped(
             let u = uv.min.x + sx * uv.width();
             let v = uv.min.y + sy * uv.height();
 
-            // Rigid rotation in pixel space about the centre.
             let px = ox * half_w;
             let py = oy * half_h;
             let pos = pos2(center.x + px * cos - py * sin, center.y + px * sin + py * cos);
@@ -1484,46 +1757,185 @@ fn draw_warped(
     painter.add(egui::Shape::mesh(mesh));
 }
 
-/// Map a screen position inside `draw_rect` to a uv coordinate within `uv`.
 fn screen_to_uv(pos: Pos2, draw_rect: Rect, uv: Rect) -> Pos2 {
     let fx = ((pos.x - draw_rect.min.x) / draw_rect.width()).clamp(0.0, 1.0);
     let fy = ((pos.y - draw_rect.min.y) / draw_rect.height()).clamp(0.0, 1.0);
     pos2(uv.min.x + fx * uv.width(), uv.min.y + fy * uv.height())
 }
 
-/// Scale `uv` about a fixed `anchor` (in uv space) by `factor`.
 fn scale_about(uv: Rect, anchor: Pos2, factor: f32) -> Rect {
     let min = anchor + (uv.min - anchor) * factor;
     let max = anchor + (uv.max - anchor) * factor;
     Rect::from_min_max(min, max)
 }
 
-/// Keep a crop rect within [0,1]², clamping size to <= 1 and nudging it in-bounds.
 fn clamp_uv(mut r: Rect) -> Rect {
     let mut w = r.width().clamp(0.02, 1.0);
     let mut h = r.height().clamp(0.02, 1.0);
-    // Re-center if the requested size overflows.
     let cx = r.center().x;
     let cy = r.center().y;
-    if w > 1.0 {
-        w = 1.0;
-    }
-    if h > 1.0 {
-        h = 1.0;
-    }
+    if w > 1.0 { w = 1.0; }
+    if h > 1.0 { h = 1.0; }
     let mut min = pos2(cx - w / 2.0, cy - h / 2.0);
-    if min.x < 0.0 {
-        min.x = 0.0;
-    }
-    if min.y < 0.0 {
-        min.y = 0.0;
-    }
-    if min.x + w > 1.0 {
-        min.x = 1.0 - w;
-    }
-    if min.y + h > 1.0 {
-        min.y = 1.0 - h;
-    }
+    if min.x < 0.0 { min.x = 0.0; }
+    if min.y < 0.0 { min.y = 0.0; }
+    if min.x + w > 1.0 { min.x = 1.0 - w; }
+    if min.y + h > 1.0 { min.y = 1.0 - h; }
     r = Rect::from_min_size(min, vec2(w, h));
     r
 }
+
+#[cfg(test)]
+mod test_layout {
+    use super::*;
+
+    #[test]
+    fn test_sidebar_layout() {
+        let ctx = egui::Context::default();
+        apply_purple_theme(&ctx);
+        install_custom_fonts(&ctx);
+        let mut app = App {
+            devices: vec![
+                Device {
+                    serial: "340YC10G810KRV".into(),
+                    state: "device".into(),
+                    usb: true,
+                    model: "Quest_3S".into(),
+                }
+            ],
+            selected_serial: Some("340YC10G810KRV".into()),
+            displays: vec![DisplayInfo { id: 0, width: 1920, height: 1080 }],
+            display_fetch: Arc::new(Mutex::new(None)),
+            settings: Settings {
+                display_id: 0,
+                max_size: 1920,
+                bitrate_mbps: 30,
+                max_fps: 60,
+                audio: false,
+            },
+            stream: None,
+            flat: None,
+            texture: None,
+            last_generation: 0,
+            tex_size: [0, 0],
+            last_frame: None,
+            capture_msg: None,
+            spout_enabled: false,
+            spout: None,
+            spout_error: None,
+            vcam_enabled: false,
+            vcam: None,
+            vcam_error: None,
+            uv: Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            lens_correct: false,
+            lens_k1: 0.0,
+            lens_k2: 0.0,
+            rotation_deg: 0.0,
+            want_autostart: false,
+            auto_reconnect: false,
+            need_display_fetch: false,
+            fetch_inflight: false,
+            remote_input: String::new(),
+            remotes: vec!["192.168.1.105:5555".into()],
+            connect_result: Arc::new(Mutex::new(None)),
+            connecting: false,
+            streamer_forced: Some(false), // UNMASKED!
+            obs_detected: false,
+            last_obs_check: Instant::now(),
+            persisted: Config::default(),
+            dirty_since: None,
+            settings_open: false,
+        };
+
+        // 1. Idle state
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let before = ui.available_rect_before_wrap().min.x;
+            app.sidebar(ui);
+            let after = ui.available_rect_before_wrap().min.x;
+            let used = after - before;
+            assert!((used - 302.0).abs() < 0.1, "Sidebar idle width expanded beyond expected: got {used}");
+        });
+
+        // 2. Streaming + Spout + VCam state
+        app.spout_enabled = true;
+        app.vcam_enabled = true;
+        app.stream = Some(StreamHandle::dummy_for_test());
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let before = ui.available_rect_before_wrap().min.x;
+            app.sidebar(ui);
+            let after = ui.available_rect_before_wrap().min.x;
+            let used = after - before;
+            assert!((used - 302.0).abs() < 0.1, "Sidebar streaming width expanded beyond expected: got {used}");
+        });
+    }
+
+    #[test]
+    fn test_settings_modal_close() {
+        let ctx = egui::Context::default();
+        let mut app = App {
+            devices: vec![],
+            selected_serial: None,
+            displays: vec![],
+            display_fetch: Arc::new(Mutex::new(None)),
+            settings: Settings {
+                display_id: 0,
+                max_size: 1920,
+                bitrate_mbps: 30,
+                max_fps: 60,
+                audio: false,
+            },
+            stream: None,
+            flat: None,
+            texture: None,
+            last_generation: 0,
+            tex_size: [0, 0],
+            last_frame: None,
+            capture_msg: None,
+            spout_enabled: false,
+            spout: None,
+            spout_error: None,
+            vcam_enabled: false,
+            vcam: None,
+            vcam_error: None,
+            uv: Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            lens_correct: false,
+            lens_k1: 0.0,
+            lens_k2: 0.0,
+            rotation_deg: 0.0,
+            want_autostart: false,
+            auto_reconnect: false,
+            need_display_fetch: false,
+            fetch_inflight: false,
+            remote_input: String::new(),
+            remotes: vec![],
+            connect_result: Arc::new(Mutex::new(None)),
+            connecting: false,
+            streamer_forced: None,
+            obs_detected: false,
+            last_obs_check: Instant::now(),
+            persisted: Config::default(),
+            dirty_since: None,
+            settings_open: true,
+        };
+
+        // Modal is open
+        assert!(app.settings_open);
+
+        // Run with Escape key pressed
+        let mut raw_input = egui::RawInput::default();
+        raw_input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run_ui(raw_input, |_ui| {
+            app.settings_modal(&ctx);
+        });
+
+        // Now settings_open must be false
+        assert!(!app.settings_open, "Settings modal did not close on Escape key!");
+    }
+}
+
