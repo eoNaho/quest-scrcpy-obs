@@ -18,7 +18,8 @@ On top of that, the Quest mirrors the stereoscopic, lens-distorted view. This cl
 - 🥽 **One-click Quest 3 preset** — left eye, lens flattened, leveled
 - 🔍 Live crop: drag to pan, scroll to zoom, eye/full presets
 - 🪞 **Flatten lens**: live radial-distortion + tilt correction (de-fisheye the VR view)
-- 🔊 Audio toggle (AAC via Media Foundation → cpal)
+- 🔊 Audio toggle (AAC via Media Foundation → cpal), with a selectable **output device** — route it away from your headphones (e.g. to an unused HDMI output) while Discord/OBS's per-process audio capture still picks it up
+- ⛶ **Fullscreen** (F11) — hides all UI chrome, just the video; Esc or F11 again to exit
 - 📷 Screenshot the current crop to PNG
 - ⏺ **Record** to `.mp4` — captures exactly the processed view you see (cropped, lens-flattened, tilted); the CLI can also do a lossless full-panel passthrough
 - 📡 **Send to OBS (Spout2)** — one click exposes the current view as a live Spout2 sender named "Quest scrcpy", so OBS can pick it up as a source with no Window Capture and no re-encoding

@@ -32,13 +32,14 @@ impl Drop for AudioHandle {
 }
 
 /// Start playback on a background thread. `stop` is shared with the video stream
-/// so both end together.
-pub fn spawn(sock: TcpStream, meta: AudioMeta, stop: Arc<AtomicBool>) -> AudioHandle {
+/// so both end together. `device` names the cpal output device to play
+/// through (empty/not found falls back to the system default).
+pub fn spawn(sock: TcpStream, meta: AudioMeta, stop: Arc<AtomicBool>, device: String) -> AudioHandle {
     let local_stop = stop.clone();
     let join = std::thread::Builder::new()
         .name("scrcpy-audio".into())
         .spawn(move || {
-            if let Err(e) = run(sock, meta, &local_stop) {
+            if let Err(e) = run(sock, meta, &local_stop, &device) {
                 eprintln!("[audio] {e:#}");
             }
         })
@@ -46,7 +47,7 @@ pub fn spawn(sock: TcpStream, meta: AudioMeta, stop: Arc<AtomicBool>) -> AudioHa
     AudioHandle { stop, join }
 }
 
-fn run(mut sock: TcpStream, meta: AudioMeta, stop: &Arc<AtomicBool>) -> Result<()> {
+fn run(mut sock: TcpStream, meta: AudioMeta, stop: &Arc<AtomicBool>, device: &str) -> Result<()> {
     match meta.codec_id {
         server::AUDIO_DISABLED => {
             eprintln!("[audio] device declined audio capture; video only");
@@ -58,7 +59,8 @@ fn run(mut sock: TcpStream, meta: AudioMeta, stop: &Arc<AtomicBool>) -> Result<(
     }
     eprintln!("[audio] codec={}", server::codec_name(meta.codec_id));
 
-    let mut player = crate::audioplay::AacPlayer::new()?;
+    let device = if device.is_empty() { None } else { Some(device) };
+    let mut player = crate::audioplay::AacPlayer::new(device)?;
     while !stop.load(Ordering::Relaxed) {
         match server::read_event(&mut sock) {
             Ok(StreamEvent::Packet(pkt)) => {

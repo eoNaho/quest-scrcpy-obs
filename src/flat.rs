@@ -252,6 +252,7 @@ impl FlatHandle {
         bitrate: u32,
         fps: u32,
         audio: bool,
+        audio_output_device: String,
         repaint: egui::Context,
     ) -> Self {
         let audio_enabled = Arc::new(AtomicBool::new(audio));
@@ -284,8 +285,8 @@ impl FlatHandle {
                     while !stop.load(Ordering::Relaxed) {
                         let started = Instant::now();
                         let result = run_gui(
-                            &serial, w, h, bitrate, fps, &audio_enabled, &stop, &slot, &status,
-                            &child, &recording, &record_rx, &repaint,
+                            &serial, w, h, bitrate, fps, &audio_enabled, &audio_output_device,
+                            &stop, &slot, &status, &child, &recording, &record_rx, &repaint,
                         );
                         // Tear down this attempt's child before retrying.
                         recording.store(false, Ordering::Relaxed);
@@ -386,6 +387,7 @@ fn run_gui(
     bitrate: u32,
     fps: u32,
     audio_enabled: &Arc<AtomicBool>,
+    audio_output_device: &str,
     stop: &Arc<AtomicBool>,
     slot: &Arc<Mutex<FrameSlot>>,
     status: &Arc<Mutex<Status>>,
@@ -494,7 +496,8 @@ fn run_gui(
                 }
             }
             if audio.is_none() {
-                match crate::audioplay::AacPlayer::new() {
+                let device = if audio_output_device.is_empty() { None } else { Some(audio_output_device) };
+                match crate::audioplay::AacPlayer::new(device) {
                     Ok(p) => {
                         flat_log("audio player created");
                         audio = Some(p);

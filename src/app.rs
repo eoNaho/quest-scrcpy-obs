@@ -47,11 +47,20 @@ struct Settings {
     bitrate_mbps: u32,
     max_fps: u32,
     audio: bool,
+    /// cpal output device name for the Quest's audio; empty = system default.
+    audio_output_device: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { display_id: 0, max_size: 1920, bitrate_mbps: 16, max_fps: 60, audio: false }
+        Self {
+            display_id: 0,
+            max_size: 1920,
+            bitrate_mbps: 16,
+            max_fps: 60,
+            audio: false,
+            audio_output_device: String::new(),
+        }
     }
 }
 
@@ -233,6 +242,7 @@ impl App {
             bitrate_mbps: cfg.bitrate_mbps,
             max_fps: cfg.max_fps,
             audio: cfg.audio,
+            audio_output_device: cfg.audio_output_device.clone(),
         };
         if let Some(v) = startup.display_id { settings.display_id = v; }
         if let Some(v) = startup.max_size { settings.max_size = v; }
@@ -377,6 +387,7 @@ impl App {
             max_fps: self.settings.max_fps,
             audio: self.settings.audio,
             audio_bit_rate: 128_000,
+            audio_output_device: self.settings.audio_output_device.clone(),
         };
         let ar = Arc::new(std::sync::atomic::AtomicBool::new(self.auto_reconnect));
         self.stream = Some(StreamHandle::start(cfg, ctx.clone(), ar));
@@ -403,10 +414,11 @@ impl App {
         self.flat = Some(crate::flat::FlatHandle::start(
             serial,
             cfg.max_size,
-            cfg.max_size, 
+            cfg.max_size,
             cfg.bitrate,
             cfg.fps,
             self.settings.audio,
+            self.settings.audio_output_device.clone(),
             ctx.clone(),
         ));
     }
@@ -467,6 +479,7 @@ impl App {
             bitrate_mbps: self.settings.bitrate_mbps,
             max_fps: self.settings.max_fps,
             audio: self.settings.audio,
+            audio_output_device: self.settings.audio_output_device.clone(),
             remotes: self.remotes.clone(),
         }
     }
@@ -598,6 +611,7 @@ impl App {
             && s.config.video_bit_rate == self.settings.bitrate_mbps * 1_000_000
             && s.config.max_fps == self.settings.max_fps
             && s.config.audio == self.settings.audio
+            && s.config.audio_output_device == self.settings.audio_output_device
     }
 
     fn flat_config(&self) -> crate::flat::FlatConfig {
@@ -708,12 +722,24 @@ impl eframe::App for App {
         self.sync_texture(ctx);
         self.autosave();
         self.poll_obs_detection();
+
+        let is_fullscreen = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+        } else if is_fullscreen && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // The toggle button is hidden in fullscreen (no chrome), so Esc is
+            // the only other way out.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.painter().rect_filled(ui.max_rect(), 0.0, Color32::from_rgb(0x14, 0x13, 0x1a));
-        self.top_bar(ui);
-        self.sidebar(ui);
+        let fullscreen = ui.ctx().input(|i| i.viewport().fullscreen).unwrap_or(false);
+        if !fullscreen {
+            self.top_bar(ui);
+            self.sidebar(ui);
+        }
         self.central_video(ui);
         self.settings_modal(ui.ctx());
     }
@@ -738,6 +764,7 @@ mod icon {
     pub const VIDEO: &str = "\u{f03d}";        // fa-video
     pub const STOP: &str = "\u{f04d}";         // fa-stop
     pub const XMARK: &str = "\u{f00d}";        // fa-xmark
+    pub const COMPRESS: &str = "\u{f066}";     // fa-compress
 }
 
 fn status_dot(ui: &mut egui::Ui, color: Color32) {
@@ -850,6 +877,26 @@ impl App {
 
                         if ui.add(gear_btn).on_hover_text("Configurações Avançadas").clicked() {
                             self.settings_open = !self.settings_open;
+                        }
+
+                        ui.add_space(8.0);
+
+                        let is_fullscreen =
+                            ui.ctx().input(|i| i.viewport().fullscreen).unwrap_or(false);
+                        let (fs_icon, fs_hover) = if is_fullscreen {
+                            (icon::COMPRESS, "Sair da tela cheia (F11)")
+                        } else {
+                            (icon::EXPAND, "Tela cheia (F11)")
+                        };
+                        let fs_btn = egui::Button::new(
+                            egui::RichText::new(fs_icon)
+                                .size(16.0)
+                                .color(Color32::from_rgb(0x8b, 0x8a, 0x96)),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE);
+                        if ui.add(fs_btn).on_hover_text(fs_hover).clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
                         }
 
                         ui.add_space(20.0);
@@ -1177,6 +1224,37 @@ impl App {
                 toggle_switch(ui, &mut self.settings.audio);
             });
         });
+
+        // Output device: route the Quest's audio elsewhere (e.g. away from
+        // your headphones) — Discord's "share sound" / OBS's Application
+        // Audio Capture are process-based and still hear it either way.
+        ui.add_space(6.0);
+        let device_label = if self.settings.audio_output_device.is_empty() {
+            "Padrão do sistema".to_string()
+        } else {
+            self.settings.audio_output_device.clone()
+        };
+        custom_combobox("audio_output_device")
+            .selected_text(egui::RichText::new(device_label).size(12.0))
+            .truncate()
+            .width(inner_w)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut self.settings.audio_output_device,
+                    String::new(),
+                    "Padrão do sistema",
+                );
+                for name in crate::audioplay::output_device_names() {
+                    ui.selectable_value(&mut self.settings.audio_output_device, name.clone(), name);
+                }
+            })
+            .response
+            .on_hover_text(
+                "Pra que o Discord/OBS continuem ouvindo o áudio do Quest mesmo sem \
+                 ele sair no seu fone: escolha aqui uma saída que você não está \
+                 ouvindo (ex: a saída HDMI de um monitor sem caixa de som). Precisa \
+                 reconectar pra aplicar.",
+            );
 
         // 7. Quality Presets
         ui.add_space(16.0);

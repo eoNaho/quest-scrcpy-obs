@@ -6,7 +6,7 @@
 //! cpal, resampling to the output device's rate as needed.
 
 use anyhow::{Result, anyhow, bail};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
@@ -37,11 +37,8 @@ pub struct MfPlayer {
 }
 
 impl MfPlayer {
-    pub fn new() -> Result<Self> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| anyhow!("no default audio output device"))?;
+    pub fn new(device_name: Option<&str>) -> Result<Self> {
+        let device = super::resolve_output_device(device_name)?;
         let supported = device
             .default_output_config()
             .map_err(|e| anyhow!("default output config: {e}"))?;

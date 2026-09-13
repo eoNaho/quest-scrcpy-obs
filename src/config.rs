@@ -17,6 +17,12 @@ pub struct Config {
     pub bitrate_mbps: u32,
     pub max_fps: u32,
     pub audio: bool,
+    /// cpal output device name to play the Quest's audio through. Empty =
+    /// system default. Lets you route audio away from your headphones (e.g.
+    /// to an unused HDMI/virtual output) while apps that capture per-process
+    /// audio (Discord "share sound", OBS Application Audio Capture) still
+    /// pick it up — those are immune to output-device routing.
+    pub audio_output_device: String,
     /// Remembered wireless-adb addresses (ip:port) for quick reconnect.
     pub remotes: Vec<String>,
 }
@@ -35,6 +41,7 @@ impl Default for Config {
             bitrate_mbps: 16,
             max_fps: 60,
             audio: false,
+            audio_output_device: String::new(),
             remotes: Vec::new(),
         }
     }
@@ -71,6 +78,7 @@ impl Config {
                 "bitrate_mbps" => c.bitrate_mbps = v.parse().unwrap_or(c.bitrate_mbps),
                 "max_fps" => c.max_fps = v.parse().unwrap_or(c.max_fps),
                 "audio" => c.audio = v == "true",
+                "audio_output_device" => c.audio_output_device = v.to_string(),
                 "remote" => {
                     let r = v.to_string();
                     if !r.is_empty() && !c.remotes.contains(&r) {
@@ -95,7 +103,8 @@ impl Config {
              max_size={}\n\
              bitrate_mbps={}\n\
              max_fps={}\n\
-             audio={}\n",
+             audio={}\n\
+             audio_output_device={}\n",
             self.lens_correct,
             self.lens_k1,
             self.lens_k2,
@@ -109,6 +118,7 @@ impl Config {
             self.bitrate_mbps,
             self.max_fps,
             self.audio,
+            self.audio_output_device,
         );
         let mut body = body;
         for r in &self.remotes {

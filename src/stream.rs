@@ -28,6 +28,8 @@ pub struct StreamConfig {
     pub max_fps: u32,
     pub audio: bool,
     pub audio_bit_rate: u32,
+    /// cpal output device to play audio through; empty = system default.
+    pub audio_output_device: String,
 }
 
 #[derive(Clone, Debug)]
@@ -295,7 +297,9 @@ fn stream_loop(cfg: &StreamConfig, ctx: &Ctx, port: u16) -> Result<()> {
     }
 
     // Optional audio runs on its own socket/thread.
-    let audio_handle = audio.map(|(sock, meta)| crate::audio::spawn(sock, meta, ctx.stop.clone()));
+    let audio_handle = audio.map(|(sock, meta)| {
+        crate::audio::spawn(sock, meta, ctx.stop.clone(), cfg.audio_output_device.clone())
+    });
 
     // The decoder is built once we learn the resolution (a session-meta event).
     let mut decoder: Option<H264Decoder> = None;
@@ -642,6 +646,7 @@ impl StreamHandle {
             max_fps: 60,
             audio: false,
             audio_bit_rate: 128_000,
+            audio_output_device: String::new(),
         };
         Self {
             stop,
