@@ -11,7 +11,9 @@ mod ffmpeg;
 mod flat;
 mod recorder;
 mod server;
+mod spout;
 mod stream;
+mod vcam;
 mod xrsp;
 
 use anyhow::{Result, anyhow};

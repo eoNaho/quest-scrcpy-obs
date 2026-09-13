@@ -21,6 +21,8 @@ On top of that, the Quest mirrors the stereoscopic, lens-distorted view. This cl
 - 🔊 Audio toggle (AAC via Media Foundation → cpal)
 - 📷 Screenshot the current crop to PNG
 - ⏺ **Record** to `.mp4` — captures exactly the processed view you see (cropped, lens-flattened, tilted); the CLI can also do a lossless full-panel passthrough
+- 📡 **Send to OBS (Spout2)** — one click exposes the current view as a live Spout2 sender named "Quest scrcpy", so OBS can pick it up as a source with no Window Capture and no re-encoding
+- 🎥 **Virtual camera** — one click exposes the current view as a real system webcam (via the OBS Virtual Camera device), usable in Zoom, Discord, browsers, or OBS itself — no Spout plugin needed
 - ⚡ Low-latency pipeline: `MF_LOW_LATENCY` decode, no-vsync present, multi-threaded NV12→RGBA
 - 💾 Settings (lens/tilt/crop/quality + remembered devices) auto-saved and restored between launches
 - 🖥️ Both a GUI and a CLI
@@ -54,6 +56,22 @@ quest-scrcpy shot --serial <SERIAL> -o frame.png                      # single-f
 
 In the GUI: pick your Quest, hit **Connect**, click **🥽 Quest 3** for the tuned view, then fine-tune **Flatten lens** (`curve`/`edge`) and `tilt°` if needed. Screenshots and clips land in a `captures/` folder next to the executable.
 
+## Streaming to OBS
+
+1. Install the [Spout2 OBS plugin](https://github.com/Off-World-Live/obs-spout2-plugin/releases) (unzip the `win-spout` folder into `C:\ProgramData\obs-studio\plugins`) and restart OBS.
+2. In quest-scrcpy, connect to your Quest and click **📡 OBS** in the toolbar. It turns into **📡 OBS: on** and starts sending the exact view you see (crop, lens-flatten, tilt included — or the full flat view when using **🥽 Flat view**).
+3. In OBS, add a source → **Spout2 Capture** → pick **Quest scrcpy** from the sender list.
+
+No Window Capture, no re-encode: OBS reads the frame straight off the GPU/CPU share, so it updates live as you drag the crop or tweak the lens.
+
+## Virtual camera
+
+Click **🎥 Virtual cam** in the toolbar to expose the current view as a real webcam, usable in any app — Zoom, Discord, a browser tab, or OBS via a **Video Capture Device** source.
+
+- Requires **OBS to be installed** (even if not running) — its installer is what registers the "OBS Virtual Camera" device other apps see; this feature just writes into that same device directly.
+- It's the *same* device OBS's own **Start Virtual Camera** button feeds, so don't run both at once — whichever starts first grabs it, the other fails to open.
+- No extra plugin to install (unlike Spout2), since it reuses OBS's own driver.
+
 ## Build
 
 ```sh
@@ -71,6 +89,8 @@ cargo build --release
 - `stream.rs` — the streaming thread tying it together
 - `app.rs` — the egui front-end (crop, lens flatten, capture controls, **🥽 Flat view**)
 - `flat.rs` — the unrooted flat-view source: pushes/runs the on-device agent, pipes its H.264 over `adb exec-out`, decodes it
+- `spout.rs` — feeds the same processed BGRA frame the screen/recorder use into a Spout2 sender, so OBS can capture it as a source
+- `vcam.rs` — feeds the same processed RGBA frame into the OBS Virtual Camera device, so it shows up as a system webcam
 - `agent/` — the on-device agent (`FlatStream`): an `app_process` (shell uid) that captures the whole flat view via `MediaProjectionManagerExt` + `MediaCodec`. Built to `assets/quest-flat-agent.jar`
 
 ## Third-party
@@ -80,3 +100,5 @@ This project embeds and launches the scrcpy server from [Genymobile/scrcpy](http
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+**Exception**: the **🎥 Virtual cam** feature depends on the [`virtualcam`](https://crates.io/crates/virtualcam) crate, which is **AGPL-3.0** licensed. Building this project with that feature included means the *resulting binary* carries AGPL-3.0 obligations (e.g. source availability) on top of the MIT license — this is a deliberate tradeoff made to get a real system-wide virtual camera without writing/registering a driver from scratch. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for details.

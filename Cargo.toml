@@ -1,6 +1,6 @@
 [package]
 name = "quest-scrcpy"
-version = "0.3.6"
+version = "0.3.8"
 edition = "2024"
 description = "Native Rust scrcpy client tuned for the Meta Quest 3 (one-eye live crop)."
 
@@ -29,6 +29,13 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Ole",
     "Win32_System_Variant",
 ] }
+# Spout2 (DX11 CPU-buffer sender) so OBS can pick up the live view as a source
+# via the Spout2 Plugin, no Window Capture needed.
+spout2-rs = { version = "0.1", default-features = false, features = ["dx"] }
+# Standard OS-level virtual camera, via the OBS Virtual Camera's own
+# shared-memory pipe, so the view shows up as a normal webcam in *any* app
+# (Zoom, Discord, browsers), not just OBS. AGPL-3.0 — see THIRD-PARTY-NOTICES.md.
+virtualcam = { version = "1.0", default-features = false, features = ["obs"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.20"

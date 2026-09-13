@@ -68,6 +68,16 @@ pub struct App {
     /// Transient feedback for capture actions (screenshot/record paths).
     capture_msg: Option<String>,
 
+    /// Live Spout2 output so OBS can add this view as a source directly.
+    spout_enabled: bool,
+    spout: Option<crate::spout::SpoutOutput>,
+    spout_error: Option<String>,
+
+    /// Live OS virtual-camera output (shows up as a webcam in any app).
+    vcam_enabled: bool,
+    vcam: Option<crate::vcam::VirtualCamOutput>,
+    vcam_error: Option<String>,
+
     /// Crop window in normalised texture coordinates (0..1).
     uv: Rect,
 
@@ -141,6 +151,12 @@ impl App {
             tex_size: [0, 0],
             last_frame: None,
             capture_msg: None,
+            spout_enabled: false,
+            spout: None,
+            spout_error: None,
+            vcam_enabled: false,
+            vcam: None,
+            vcam_error: None,
             uv: Rect::from_min_max(
                 pos2(cfg.uv[0], cfg.uv[1]),
                 pos2(cfg.uv[2], cfg.uv[3]),
@@ -536,6 +552,64 @@ impl App {
             }
             // Keep the raw frame around for screenshots.
             self.last_frame = Some(frame);
+            self.push_live_outputs();
+        }
+    }
+
+    /// The crop/lens/tilt view currently on screen, and the output size it
+    /// implies — the flat view has no crop, so it's the identity view at the
+    /// frame's own size.
+    fn live_view(&self, frame: &Frame) -> (ViewParams, u32, u32) {
+        if self.flat.is_some() {
+            (ViewParams::default(), frame.width, frame.height)
+        } else {
+            let view = ViewParams {
+                uv: [self.uv.min.x, self.uv.min.y, self.uv.max.x, self.uv.max.y],
+                lens_correct: self.lens_correct,
+                k1: self.lens_k1,
+                k2: self.lens_k2,
+                rotation_deg: self.rotation_deg,
+            };
+            let (ow, oh) = crate::stream::output_dims(&view, frame.width, frame.height);
+            (view, ow, oh)
+        }
+    }
+
+    /// Mirror the current view into Spout and/or the virtual camera, for
+    /// whichever outputs are enabled. Reuses the same warp as recording, at
+    /// decode fps.
+    fn push_live_outputs(&mut self) {
+        if !self.spout_enabled && !self.vcam_enabled {
+            return;
+        }
+        let Some(frame) = &self.last_frame else { return };
+        let (view, ow, oh) = self.live_view(frame);
+
+        if self.spout_enabled {
+            let bgra = crate::stream::warp_to_bgra(frame, &view, ow, oh);
+            let sender =
+                self.spout.get_or_insert_with(|| crate::spout::SpoutOutput::new("Quest scrcpy"));
+            match sender.send(&bgra, ow, oh) {
+                Ok(()) => self.spout_error = None,
+                Err(e) => {
+                    self.spout_error = Some(format!("{e:#}"));
+                    self.spout_enabled = false;
+                    self.spout = None;
+                }
+            }
+        }
+
+        if self.vcam_enabled {
+            let rgba = crate::stream::warp_to_rgba(frame, &view, ow, oh);
+            let cam = self.vcam.get_or_insert_with(crate::vcam::VirtualCamOutput::new);
+            match cam.send(&rgba, ow, oh) {
+                Ok(()) => self.vcam_error = None,
+                Err(e) => {
+                    self.vcam_error = Some(format!("{e:#}"));
+                    self.vcam_enabled = false;
+                    self.vcam = None;
+                }
+            }
         }
     }
 }
@@ -823,12 +897,61 @@ impl App {
                     {
                         self.toggle_recording();
                     }
+
+                    let spout_label = if self.spout_enabled { "📡 OBS: on" } else { "📡 OBS" };
+                    if ui
+                        .add(egui::Button::selectable(self.spout_enabled, spout_label))
+                        .on_hover_text(
+                            "Expose this view as a Spout2 source — add \"Quest scrcpy\" \
+                             in OBS via the Spout2 Plugin",
+                        )
+                        .clicked()
+                    {
+                        self.spout_enabled = !self.spout_enabled;
+                        if !self.spout_enabled {
+                            self.spout = None;
+                        }
+                        self.spout_error = None;
+                    }
+
+                    let vcam_label = if self.vcam_enabled { "🎥 Virtual cam: on" } else { "🎥 Virtual cam" };
+                    if ui
+                        .add(egui::Button::selectable(self.vcam_enabled, vcam_label))
+                        .on_hover_text(
+                            "Expose this view as a system webcam (via the OBS Virtual \
+                             Camera device) — usable in Zoom, Discord, browsers, or as a \
+                             Video Capture Device source in OBS. Requires OBS installed \
+                             (not necessarily running), and can't run at the same time as \
+                             OBS's own \"Start Virtual Camera\".",
+                        )
+                        .clicked()
+                    {
+                        self.vcam_enabled = !self.vcam_enabled;
+                        if !self.vcam_enabled {
+                            self.vcam = None;
+                        }
+                        self.vcam_error = None;
+                    }
                 }
             });
 
             if let Some(msg) = &self.capture_msg {
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new(msg).weak().small());
+            }
+            if let Some(err) = &self.spout_error {
+                ui.add_space(2.0);
+                ui.colored_label(
+                    Color32::from_rgb(0xff, 0x6b, 0x6b),
+                    format!("Spout: {err}"),
+                );
+            }
+            if let Some(err) = &self.vcam_error {
+                ui.add_space(2.0);
+                ui.colored_label(
+                    Color32::from_rgb(0xff, 0x6b, 0x6b),
+                    format!("Virtual cam: {err}"),
+                );
             }
             ui.add_space(4.0);
         });

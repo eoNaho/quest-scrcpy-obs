@@ -399,6 +399,16 @@ pub fn output_dims(p: &ViewParams, frame_w: u32, frame_h: u32) -> (u32, u32) {
 /// into a top-down BGRA buffer of `out_w`×`out_h` — the inverse of the GPU mesh
 /// in the GUI, so a recording matches what's on screen. Parallelised by rows.
 pub fn warp_to_bgra(frame: &Frame, p: &ViewParams, out_w: u32, out_h: u32) -> Vec<u8> {
+    warp_frame(frame, p, out_w, out_h, true)
+}
+
+/// Same as [`warp_to_bgra`], but keeps RGBA channel order — for consumers
+/// that expect RGBA (e.g. the virtual-camera output).
+pub fn warp_to_rgba(frame: &Frame, p: &ViewParams, out_w: u32, out_h: u32) -> Vec<u8> {
+    warp_frame(frame, p, out_w, out_h, false)
+}
+
+fn warp_frame(frame: &Frame, p: &ViewParams, out_w: u32, out_h: u32, swap_rb: bool) -> Vec<u8> {
     let fw = frame.width as f32;
     let fh = frame.height as f32;
     let (k1, k2) = if p.lens_correct { (p.k1, p.k2) } else { (0.0, 0.0) };
@@ -443,9 +453,15 @@ pub fn warp_to_bgra(frame: &Frame, p: &ViewParams, out_w: u32, out_h: u32) -> Ve
                         let py = (crop_min_y + sy * crop_h) as usize;
                         let si = (py.min(fhi - 1) * fwi + px.min(fwi - 1)) * 4;
                         let o = (r * ow + i) * 4;
-                        chunk[o] = src[si + 2]; // B
-                        chunk[o + 1] = src[si + 1]; // G
-                        chunk[o + 2] = src[si]; // R
+                        if swap_rb {
+                            chunk[o] = src[si + 2]; // B
+                            chunk[o + 1] = src[si + 1]; // G
+                            chunk[o + 2] = src[si]; // R
+                        } else {
+                            chunk[o] = src[si]; // R
+                            chunk[o + 1] = src[si + 1]; // G
+                            chunk[o + 2] = src[si + 2]; // B
+                        }
                         chunk[o + 3] = 255;
                     }
                 }
