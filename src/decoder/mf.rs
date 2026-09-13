@@ -6,13 +6,14 @@
 //! when ffmpeg is not on PATH (see the parent module).
 
 use anyhow::{Result, anyhow, bail};
+use rayon::prelude::*;
 use std::mem::ManuallyDrop;
 
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
-use windows::core::GUID;
+use windows::core::{GUID, Interface};
 
 use super::Frame;
 
@@ -55,6 +56,10 @@ impl MfDecoder {
             // straight back out instead of being held in the DPB.
             if let Ok(attrs) = transform.GetAttributes() {
                 let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+            }
+            if let Ok(codec_api) = transform.cast::<ICodecAPI>() {
+                let var = windows::Win32::System::Variant::VARIANT::from(true);
+                let _ = codec_api.SetValue(&CODECAPI_AVLowLatencyMode, &var);
             }
 
             // Input type: H.264, progressive, with a size hint.
@@ -237,9 +242,8 @@ impl Drop for MfDecoder {
 /// NV12 -> RGBA (BT.601 limited range). `stride`/`coded_h` describe the source
 /// buffer layout; `vw`/`vh` is the visible top-left region we keep.
 ///
-/// The per-pixel conversion is the heaviest CPU cost in the pipeline, so we
-/// split the output rows across worker threads: at high frame-rates a single
-/// core can't keep up with a ~2 MP frame, and any backlog turns into latency.
+/// Uses Rayon for zero-overhead thread pooling across cores, and processes pairs
+/// of pixels at a time to share chroma (U/V) computations.
 fn nv12_to_rgba(
     data: &[u8],
     stride: usize,
@@ -253,45 +257,73 @@ fn nv12_to_rgba(
     }
     let mut rgba = vec![0u8; vw * vh * 4];
 
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 8);
-    let rows_per = vh.div_ceil(threads);
+    // 16 rows per chunk is optimal for cache locality and work distribution
+    let rows_per = 16;
+    let chunk_size = rows_per * vw * 4;
 
-    std::thread::scope(|s| {
-        for (chunk_idx, out_chunk) in rgba.chunks_mut(rows_per * vw * 4).enumerate() {
+    rgba.par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, out_chunk)| {
             let y_start = chunk_idx * rows_per;
-            let data = &*data;
-            s.spawn(move || {
-                let rows = out_chunk.len() / (vw * 4);
-                for r in 0..rows {
-                    let y = y_start + r;
-                    let y_row = y * stride;
-                    let uv_row = uv_offset + (y / 2) * stride;
-                    let out_row = r * vw * 4;
-                    for x in 0..vw {
-                        let yy = data[y_row + x] as i32;
-                        let uv_x = x & !1;
-                        let u = data[uv_row + uv_x] as i32;
-                        let v = data[uv_row + uv_x + 1] as i32;
+            let rows = out_chunk.len() / (vw * 4);
+            for r in 0..rows {
+                let y = y_start + r;
+                let y_row = y * stride;
+                let uv_row = uv_offset + (y / 2) * stride;
+                let out_row = r * vw * 4;
 
-                        let c = yy - 16;
-                        let d = u - 128;
-                        let e = v - 128;
-                        let r0 = (298 * c + 409 * e + 128) >> 8;
-                        let g0 = (298 * c - 100 * d - 208 * e + 128) >> 8;
-                        let b0 = (298 * c + 516 * d + 128) >> 8;
+                let mut x = 0;
+                while x + 1 < vw {
+                    let uv_x = x & !1;
+                    let u = data[uv_row + uv_x] as i32;
+                    let v = data[uv_row + uv_x + 1] as i32;
+                    let d = u - 128;
+                    let e = v - 128;
 
-                        let o = out_row + x * 4;
-                        out_chunk[o] = r0.clamp(0, 255) as u8;
-                        out_chunk[o + 1] = g0.clamp(0, 255) as u8;
-                        out_chunk[o + 2] = b0.clamp(0, 255) as u8;
-                        out_chunk[o + 3] = 255;
-                    }
+                    // Chroma terms shared by the pixel pair:
+                    let r_uv = 409 * e + 128;
+                    let g_uv = -100 * d - 208 * e + 128;
+                    let b_uv = 516 * d + 128;
+
+                    // Pixel 1:
+                    let yy1 = data[y_row + x] as i32;
+                    let c1 = (yy1 - 16) * 298;
+                    let o1 = out_row + x * 4;
+                    out_chunk[o1] = ((c1 + r_uv) >> 8).clamp(0, 255) as u8;
+                    out_chunk[o1 + 1] = ((c1 + g_uv) >> 8).clamp(0, 255) as u8;
+                    out_chunk[o1 + 2] = ((c1 + b_uv) >> 8).clamp(0, 255) as u8;
+                    out_chunk[o1 + 3] = 255;
+
+                    // Pixel 2:
+                    let yy2 = data[y_row + x + 1] as i32;
+                    let c2 = (yy2 - 16) * 298;
+                    let o2 = out_row + (x + 1) * 4;
+                    out_chunk[o2] = ((c2 + r_uv) >> 8).clamp(0, 255) as u8;
+                    out_chunk[o2 + 1] = ((c2 + g_uv) >> 8).clamp(0, 255) as u8;
+                    out_chunk[o2 + 2] = ((c2 + b_uv) >> 8).clamp(0, 255) as u8;
+                    out_chunk[o2 + 3] = 255;
+
+                    x += 2;
                 }
-            });
-        }
-    });
+
+                if x < vw {
+                    let uv_x = x & !1;
+                    let u = data[uv_row + uv_x] as i32;
+                    let v = data[uv_row + uv_x + 1] as i32;
+                    let c = (data[y_row + x] as i32 - 16) * 298;
+                    let d = u - 128;
+                    let e = v - 128;
+                    let r0 = (c + 409 * e + 128) >> 8;
+                    let g0 = (c - 100 * d - 208 * e + 128) >> 8;
+                    let b0 = (c + 516 * d + 128) >> 8;
+
+                    let o = out_row + x * 4;
+                    out_chunk[o] = r0.clamp(0, 255) as u8;
+                    out_chunk[o + 1] = g0.clamp(0, 255) as u8;
+                    out_chunk[o + 2] = b0.clamp(0, 255) as u8;
+                    out_chunk[o + 3] = 255;
+                }
+            }
+        });
     Some(Frame { width: vw as u32, height: vh as u32, rgba })
 }

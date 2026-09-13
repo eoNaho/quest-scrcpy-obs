@@ -208,7 +208,7 @@ impl Default for ServerOptions {
             display_id: 0,
             max_size: 0, // 0 = no downscale (full panel)
             video_bit_rate: 16_000_000,
-            max_fps: 0,
+            max_fps: 60,
             audio: false,
             audio_bit_rate: 128_000,
         }
@@ -232,6 +232,7 @@ impl ServerOptions {
             format!("max_size={}", self.max_size),
             format!("video_bit_rate={}", self.video_bit_rate),
             format!("max_fps={}", self.max_fps),
+            "video_codec_options=latency=0,priority=0".into(),
         ];
         if self.audio {
             // AAC so we can reuse the Media Foundation decode stack (no libopus build).

@@ -36,16 +36,19 @@ fn flat_log(msg: &str) {
     eprintln!("[flat] {msg}");
 }
 
+use rayon::prelude::*;
+
 /// RGBA (decoder output) -> BGRA (what [`ClipEncoder`] wants).
 fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; rgba.len()];
-    for (i, px) in rgba.chunks_exact(4).enumerate() {
-        let o = i * 4;
-        out[o] = px[2];
-        out[o + 1] = px[1];
-        out[o + 2] = px[0];
-        out[o + 3] = 255;
-    }
+    out.par_chunks_exact_mut(4)
+        .zip(rgba.par_chunks_exact(4))
+        .for_each(|(dst, src)| {
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = 255;
+        });
     out
 }
 
@@ -184,9 +187,10 @@ pub fn run_flat_shot(
     // Headless one-shot: video only, no need to capture audio.
     let mut child = spawn_agent(serial, w, h, bitrate, fps, false)?;
     drain_stderr(&mut child);
-    let mut stdout = child.stdout.take().context("agent stdout missing")?;
+    let stdout = child.stdout.take().context("agent stdout missing")?;
+    let mut reader = std::io::BufReader::with_capacity(65536, stdout);
 
-    let (w, h) = read_dims(&mut stdout)?;
+    let (w, h) = read_dims(&mut reader)?;
     eprintln!("[flat] stream {w}x{h}, decoding for {seconds}s…");
     let mut dec = H264Decoder::new(w, h)?;
 
@@ -194,7 +198,7 @@ pub fn run_flat_shot(
     let mut last: Option<Frame> = None;
     let mut count = 0u64;
     while Instant::now() < deadline {
-        match read_packet(&mut stdout)? {
+        match read_packet(&mut reader)? {
             Some((0, au)) => {
                 for frame in dec.decode(&au)? {
                     last = Some(frame);
@@ -399,10 +403,11 @@ fn run_gui(
     // toggle takes effect instantly instead of needing a reconnect.
     let mut child = spawn_agent(serial, w, h, bitrate, fps, true)?;
     drain_stderr(&mut child);
-    let mut stdout = child.stdout.take().context("agent stdout missing")?;
+    let stdout = child.stdout.take().context("agent stdout missing")?;
     *child_slot.lock().unwrap() = Some(child);
+    let mut reader = std::io::BufReader::with_capacity(65536, stdout);
 
-    let (w, h) = read_dims(&mut stdout)?;
+    let (w, h) = read_dims(&mut reader)?;
     flat_log(&format!(
         "stream started {w}x{h}; ffmpeg_for_playback={}",
         crate::ffmpeg::use_for_playback()
@@ -449,7 +454,7 @@ fn run_gui(
             }
         }
 
-        let (kind, data) = match read_packet(&mut stdout) {
+        let (kind, data) = match read_packet(&mut reader) {
             Ok(Some(p)) => p,
             Ok(None) => break,
             Err(e) => {

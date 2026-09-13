@@ -33,7 +33,7 @@ impl Default for Config {
             display_id: 0,
             max_size: 1920,
             bitrate_mbps: 16,
-            max_fps: 0,
+            max_fps: 60,
             audio: false,
             remotes: Vec::new(),
         }

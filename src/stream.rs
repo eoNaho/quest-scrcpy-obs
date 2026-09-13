@@ -11,6 +11,7 @@ use crate::recorder::ClipEncoder;
 use crate::server;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use rayon::prelude::*;
 use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -408,9 +409,55 @@ pub fn warp_to_rgba(frame: &Frame, p: &ViewParams, out_w: u32, out_h: u32) -> Ve
     warp_frame(frame, p, out_w, out_h, false)
 }
 
-fn warp_frame(frame: &Frame, p: &ViewParams, out_w: u32, out_h: u32, swap_rb: bool) -> Vec<u8> {
-    let fw = frame.width as f32;
-    let fh = frame.height as f32;
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RemapKey {
+    fw: u32,
+    fh: u32,
+    ow: u32,
+    oh: u32,
+    uv: [u32; 4],
+    lens_correct: bool,
+    k1: u32,
+    k2: u32,
+    rot: u32,
+}
+
+static REMAP_CACHE: Mutex<Option<(RemapKey, Arc<Vec<usize>>)>> = Mutex::new(None);
+
+fn get_or_compute_remap(
+    frame_w: u32,
+    frame_h: u32,
+    p: &ViewParams,
+    out_w: u32,
+    out_h: u32,
+) -> Arc<Vec<usize>> {
+    let key = RemapKey {
+        fw: frame_w,
+        fh: frame_h,
+        ow: out_w,
+        oh: out_h,
+        uv: [
+            p.uv[0].to_bits(),
+            p.uv[1].to_bits(),
+            p.uv[2].to_bits(),
+            p.uv[3].to_bits(),
+        ],
+        lens_correct: p.lens_correct,
+        k1: p.k1.to_bits(),
+        k2: p.k2.to_bits(),
+        rot: p.rotation_deg.to_bits(),
+    };
+
+    if let Ok(guard) = REMAP_CACHE.lock() {
+        if let Some((k, map)) = &*guard {
+            if *k == key {
+                return map.clone();
+            }
+        }
+    }
+
+    let fw = frame_w as f32;
+    let fh = frame_h as f32;
     let (k1, k2) = if p.lens_correct { (p.k1, p.k2) } else { (0.0, 0.0) };
     let (sin, cos) = p.rotation_deg.to_radians().sin_cos();
     let crop_min_x = p.uv[0] * fw;
@@ -420,53 +467,96 @@ fn warp_frame(frame: &Frame, p: &ViewParams, out_w: u32, out_h: u32, swap_rb: bo
 
     let ow = out_w as usize;
     let oh = out_h as usize;
-    let fwi = frame.width as usize;
-    let fhi = frame.height as usize;
+    let fwi = frame_w as usize;
+    let fhi = frame_h as usize;
+
+    let mut map = vec![0usize; ow * oh];
+    let rows_per = 16;
+    map.par_chunks_mut(rows_per * ow)
+        .enumerate()
+        .for_each(|(chunk_idx, row_chunk)| {
+            let y_start = chunk_idx * rows_per;
+            let rows = row_chunk.len() / ow;
+            for r in 0..rows {
+                let j = y_start + r;
+                let oy = 2.0 * j as f32 / (oh as f32 - 1.0).max(1.0) - 1.0;
+                for i in 0..ow {
+                    let ox = 2.0 * i as f32 / (ow as f32 - 1.0).max(1.0) - 1.0;
+                    let rx = ox * cos + oy * sin;
+                    let ry = -ox * sin + oy * cos;
+                    let r2 = rx * rx + ry * ry;
+                    let f = 1.0 + k1 * r2 + k2 * r2 * r2;
+                    let sx = (0.5 + 0.5 * rx * f).clamp(0.0, 1.0);
+                    let sy = (0.5 + 0.5 * ry * f).clamp(0.0, 1.0);
+                    let px = (crop_min_x + sx * crop_w) as usize;
+                    let py = (crop_min_y + sy * crop_h) as usize;
+                    let si = (py.min(fhi - 1) * fwi + px.min(fwi - 1)) * 4;
+                    row_chunk[r * ow + i] = si;
+                }
+            }
+        });
+
+    let arc = Arc::new(map);
+    if let Ok(mut guard) = REMAP_CACHE.lock() {
+        *guard = Some((key, arc.clone()));
+    }
+    arc
+}
+
+fn warp_frame(frame: &Frame, p: &ViewParams, out_w: u32, out_h: u32, swap_rb: bool) -> Vec<u8> {
+    let ow = out_w as usize;
+    let oh = out_h as usize;
     let src = &frame.rgba;
     let mut out = vec![0u8; ow * oh * 4];
 
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 8);
-    let rows_per = oh.div_ceil(threads);
-
-    std::thread::scope(|sc| {
-        for (ci, chunk) in out.chunks_mut(rows_per * ow * 4).enumerate() {
-            let y0 = ci * rows_per;
-            let src = &*src;
-            sc.spawn(move || {
-                let rows = chunk.len() / (ow * 4);
-                for r in 0..rows {
-                    let j = y0 + r;
-                    let oy = 2.0 * j as f32 / (oh as f32 - 1.0) - 1.0;
-                    for i in 0..ow {
-                        let ox = 2.0 * i as f32 / (ow as f32 - 1.0) - 1.0;
-                        // Inverse rotation R(-angle) to find the pre-rotation coord.
-                        let rx = ox * cos + oy * sin;
-                        let ry = -ox * sin + oy * cos;
-                        let r2 = rx * rx + ry * ry;
-                        let f = 1.0 + k1 * r2 + k2 * r2 * r2;
-                        let sx = (0.5 + 0.5 * rx * f).clamp(0.0, 1.0);
-                        let sy = (0.5 + 0.5 * ry * f).clamp(0.0, 1.0);
-                        let px = (crop_min_x + sx * crop_w) as usize;
-                        let py = (crop_min_y + sy * crop_h) as usize;
-                        let si = (py.min(fhi - 1) * fwi + px.min(fwi - 1)) * 4;
-                        let o = (r * ow + i) * 4;
-                        if swap_rb {
-                            chunk[o] = src[si + 2]; // B
-                            chunk[o + 1] = src[si + 1]; // G
-                            chunk[o + 2] = src[si]; // R
-                        } else {
-                            chunk[o] = src[si]; // R
-                            chunk[o + 1] = src[si + 1]; // G
-                            chunk[o + 2] = src[si + 2]; // B
-                        }
-                        chunk[o + 3] = 255;
-                    }
-                }
-            });
+    // Ultra-fast path: Identity (flat view or uncropped without distortion/rotation)
+    if !p.lens_correct
+        && p.rotation_deg == 0.0
+        && p.uv == [0.0, 0.0, 1.0, 1.0]
+        && out_w == frame.width
+        && out_h == frame.height
+    {
+        if swap_rb {
+            out.par_chunks_exact_mut(4)
+                .zip(src.par_chunks_exact(4))
+                .for_each(|(dst, s)| {
+                    dst[0] = s[2]; // B
+                    dst[1] = s[1]; // G
+                    dst[2] = s[0]; // R
+                    dst[3] = 255;
+                });
+        } else {
+            out.copy_from_slice(src);
         }
-    });
+        return out;
+    }
+
+    // Remap gather path (uses cached lookup table with zero per-frame trigonometry):
+    let map = get_or_compute_remap(frame.width, frame.height, p, out_w, out_h);
+
+    let rows_per = 16;
+    let chunk_size = rows_per * ow * 4;
+    let map_chunk_size = rows_per * ow;
+
+    out.par_chunks_mut(chunk_size)
+        .zip(map.par_chunks(map_chunk_size))
+        .for_each(|(chunk, map_slice)| {
+            let px_count = map_slice.len();
+            for i in 0..px_count {
+                let si = map_slice[i];
+                let o = i * 4;
+                if swap_rb {
+                    chunk[o] = src[si + 2]; // B
+                    chunk[o + 1] = src[si + 1]; // G
+                    chunk[o + 2] = src[si]; // R
+                } else {
+                    chunk[o] = src[si]; // R
+                    chunk[o + 1] = src[si + 1]; // G
+                    chunk[o + 2] = src[si + 2]; // B
+                }
+                chunk[o + 3] = 255;
+            }
+        });
+
     out
 }

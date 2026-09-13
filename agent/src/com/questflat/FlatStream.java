@@ -118,6 +118,15 @@ public class FlatStream {
         fmt.setInteger(MediaFormat.KEY_FRAME_RATE, FPS);
         fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
         fmt.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L);
+        try {
+            fmt.setInteger(MediaFormat.KEY_PRIORITY, 0); // realtime priority
+        } catch (Throwable ignore) {}
+        try {
+            fmt.setInteger(MediaFormat.KEY_LATENCY, 0); // low-latency mode (API 30+)
+        } catch (Throwable ignore) {}
+        try {
+            fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
+        } catch (Throwable ignore) {}
         MediaCodec enc = MediaCodec.createEncoderByType("video/avc");
         enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
         Surface surface = enc.createInputSurface();
@@ -181,7 +190,7 @@ public class FlatStream {
         long frames = 0, bytes = 0;
         try {
             while (true) {
-                int idx = enc.dequeueOutputBuffer(info, 250_000);
+                int idx = enc.dequeueOutputBuffer(info, 10_000);
                 if (idx >= 0) {
                     if (info.size > 0) {
                         ByteBuffer buf = enc.getOutputBuffer(idx);

@@ -21,9 +21,9 @@ const MF_VERSION_VAL: u32 = 0x0002_0070;
 /// CLSID_CMSAACDecMFT — Microsoft AAC Audio Decoder.
 const CLSID_AAC_DECODER: GUID = GUID::from_u128(0x32D186A7_218F_4C75_8876_DD77273A8999);
 
-/// ~150 ms ceiling on queued audio (stereo @ 48 kHz) to bound A/V latency if
-/// decode outruns playback — small enough to stay in sync with low-latency video.
-const MAX_QUEUED_SAMPLES: usize = (48_000 * 2 * 150) / 1000;
+/// ~50 ms ceiling on queued audio (stereo @ 48 kHz) to bound A/V latency if
+/// decode outruns playback — small enough to stay in sync with ultra-low-latency video.
+const MAX_QUEUED_SAMPLES: usize = (48_000 * 2 * 50) / 1000;
 
 pub struct MfPlayer {
     shared: Arc<Mutex<VecDeque<f32>>>,
