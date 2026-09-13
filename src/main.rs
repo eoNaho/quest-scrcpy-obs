@@ -9,6 +9,7 @@ mod config;
 mod decoder;
 mod ffmpeg;
 mod flat;
+mod obsdetect;
 mod recorder;
 mod server;
 mod spout;

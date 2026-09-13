@@ -10,7 +10,7 @@ use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, pos2, vec2};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The "solid" Quest 3 view profile applied by the one-click preset button.
 /// Left-eye crop + lens-flatten coefficients + tilt. Tune to taste; the GUI also
@@ -102,6 +102,13 @@ pub struct App {
     connect_result: Arc<Mutex<Option<(String, Result<String, String>)>>>,
     connecting: bool,
 
+    /// Streamer mode: hide device serials / saved Wi-Fi addresses from the UI
+    /// so they don't leak into a capture. `None` = auto (follow `obs_detected`);
+    /// `Some(_)` = manual override, set by clicking the toolbar toggle.
+    streamer_forced: Option<bool>,
+    obs_detected: bool,
+    last_obs_check: Instant,
+
     /// Last-persisted settings + a debounce timer, so edits auto-save shortly
     /// after the user stops fiddling (rather than thrashing the disk each frame).
     persisted: Config,
@@ -172,6 +179,9 @@ impl App {
             remotes: cfg.remotes.clone(),
             connect_result: Arc::new(Mutex::new(None)),
             connecting: false,
+            streamer_forced: None,
+            obs_detected: crate::obsdetect::is_running(),
+            last_obs_check: Instant::now(),
             persisted: cfg,
             dirty_since: None,
         };
@@ -612,6 +622,22 @@ impl App {
             }
         }
     }
+
+    /// Re-check whether OBS is running every couple seconds — cheap enough
+    /// (one process-list snapshot) but no need to do it every UI frame.
+    fn poll_obs_detection(&mut self) {
+        if self.last_obs_check.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_obs_check = Instant::now();
+        self.obs_detected = crate::obsdetect::is_running();
+    }
+
+    /// Whether identifying info (device serials, saved Wi-Fi addresses)
+    /// should currently be masked in the UI.
+    fn streamer_active(&self) -> bool {
+        self.streamer_forced.unwrap_or(self.obs_detected)
+    }
 }
 
 impl eframe::App for App {
@@ -631,6 +657,7 @@ impl eframe::App for App {
         }
         self.sync_texture(ctx);
         self.autosave();
+        self.poll_obs_detection();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -651,18 +678,19 @@ impl App {
                     .selected_serial
                     .as_ref()
                     .and_then(|s| self.devices.iter().find(|d| &d.serial == s))
-                    .map(|d| d.label())
+                    .map(|d| d.label_masked(self.streamer_active()))
                     .unwrap_or_else(|| "No device".into());
                 let mut changed_device = false;
                 egui::ComboBox::from_id_salt("device")
                     .selected_text(dev_label)
                     .width(260.0)
                     .show_ui(ui, |ui| {
+                        let mask = self.streamer_active();
                         for d in self.devices.iter().filter(|d| d.state == "device") {
                             if ui
                                 .selectable_label(
                                     self.selected_serial.as_deref() == Some(&d.serial),
-                                    d.label(),
+                                    d.label_masked(mask),
                                 )
                                 .clicked()
                             {
@@ -698,6 +726,36 @@ impl App {
                             ui.selectable_value(&mut self.settings.display_id, d.id, d.label());
                         }
                     });
+
+                ui.separator();
+
+                // Streamer mode: auto-hides device serials / saved Wi-Fi
+                // addresses while OBS is running; click to override.
+                let (streamer_label, streamer_hover) = match self.streamer_forced {
+                    Some(true) => ("🥷 Streamer: on", "Always hiding serials/IPs — click for auto"),
+                    Some(false) => {
+                        ("🥷 Streamer: off", "Never hiding serials/IPs — click for auto")
+                    }
+                    None if self.obs_detected => (
+                        "🥷 Streamer: auto (OBS open)",
+                        "OBS detected — serials/IPs are hidden. Click to force off.",
+                    ),
+                    None => (
+                        "🥷 Streamer: auto",
+                        "Will hide serials/IPs automatically when OBS is running. Click to force on.",
+                    ),
+                };
+                if ui
+                    .add(egui::Button::selectable(self.streamer_active(), streamer_label))
+                    .on_hover_text(streamer_hover)
+                    .clicked()
+                {
+                    self.streamer_forced = match self.streamer_forced {
+                        None => Some(true),
+                        Some(true) => Some(false),
+                        Some(false) => None,
+                    };
+                }
             });
 
             // Wireless adb: connect to / remember Quests over the network.
@@ -737,9 +795,11 @@ impl App {
                     }
                     let mut connect_one = None;
                     let mut forget = None;
+                    let mask = self.streamer_active();
                     for r in self.remotes.clone() {
+                        let shown = if mask { "•••".to_string() } else { r.clone() };
                         if ui
-                            .add_enabled(!self.connecting, egui::Button::new(format!("🔗 {r}")))
+                            .add_enabled(!self.connecting, egui::Button::new(format!("🔗 {shown}")))
                             .on_hover_text("Reconnect & select")
                             .clicked()
                         {

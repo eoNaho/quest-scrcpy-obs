@@ -58,11 +58,18 @@ pub struct Device {
 impl Device {
     /// A friendly label for dropdowns, e.g. `Quest_3 (USB)` or `Quest_3 (192.168.1.35:5555)`.
     pub fn label(&self) -> String {
+        self.label_masked(false)
+    }
+
+    /// Same as [`Self::label`], but replaces the identifying serial/IP with
+    /// `•••` when `mask` is set — for streamer mode.
+    pub fn label_masked(&self, mask: bool) -> String {
         let model = if self.model.is_empty() { "device" } else { &self.model };
+        let id: &str = if mask { "•••" } else { &self.serial };
         if self.usb {
-            format!("{model}  (USB · {})", self.serial)
+            format!("{model}  (USB · {id})")
         } else {
-            format!("{model}  ({})", self.serial)
+            format!("{model}  ({id})")
         }
     }
 }

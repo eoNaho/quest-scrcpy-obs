@@ -1,6 +1,6 @@
 [package]
 name = "quest-scrcpy"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2024"
 description = "Native Rust scrcpy client tuned for the Meta Quest 3 (one-eye live crop)."
 
@@ -28,6 +28,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_Ole",
     "Win32_System_Variant",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 # Spout2 (DX11 CPU-buffer sender) so OBS can pick up the live view as a source
 # via the Spout2 Plugin, no Window Capture needed.

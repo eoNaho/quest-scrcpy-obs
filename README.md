@@ -23,6 +23,7 @@ On top of that, the Quest mirrors the stereoscopic, lens-distorted view. This cl
 - ⏺ **Record** to `.mp4` — captures exactly the processed view you see (cropped, lens-flattened, tilted); the CLI can also do a lossless full-panel passthrough
 - 📡 **Send to OBS (Spout2)** — one click exposes the current view as a live Spout2 sender named "Quest scrcpy", so OBS can pick it up as a source with no Window Capture and no re-encoding
 - 🎥 **Virtual camera** — one click exposes the current view as a real system webcam (via the OBS Virtual Camera device), usable in Zoom, Discord, browsers, or OBS itself — no Spout plugin needed
+- 🥷 **Streamer mode** — auto-hides device serials and saved Wi-Fi addresses from the UI whenever OBS is running (so they don't leak into a Window/Display Capture), with a manual override
 - ⚡ Low-latency pipeline: `MF_LOW_LATENCY` decode, no-vsync present, multi-threaded NV12→RGBA
 - 💾 Settings (lens/tilt/crop/quality + remembered devices) auto-saved and restored between launches
 - 🖥️ Both a GUI and a CLI
@@ -72,6 +73,10 @@ Click **🎥 Virtual cam** in the toolbar to expose the current view as a real w
 - It's the *same* device OBS's own **Start Virtual Camera** button feeds, so don't run both at once — whichever starts first grabs it, the other fails to open.
 - No extra plugin to install (unlike Spout2), since it reuses OBS's own driver.
 
+## Streamer mode
+
+Device serials and remembered Wi-Fi addresses (`ip:port`) are personally-identifying hardware info with no reason to show up on stream. **🥷 Streamer mode** hides them automatically whenever it detects `obs64.exe` running (checked every couple seconds), replacing them with `•••` in the device picker and the Wi-Fi reconnect chips. Click the toolbar button to override it: cycles **Auto → always on → always off → Auto**.
+
 ## Build
 
 ```sh
@@ -91,6 +96,7 @@ cargo build --release
 - `flat.rs` — the unrooted flat-view source: pushes/runs the on-device agent, pipes its H.264 over `adb exec-out`, decodes it
 - `spout.rs` — feeds the same processed BGRA frame the screen/recorder use into a Spout2 sender, so OBS can capture it as a source
 - `vcam.rs` — feeds the same processed RGBA frame into the OBS Virtual Camera device, so it shows up as a system webcam
+- `obsdetect.rs` — a Toolhelp32 process-list check for `obs64.exe`, driving streamer mode's auto-hide
 - `agent/` — the on-device agent (`FlatStream`): an `app_process` (shell uid) that captures the whole flat view via `MediaProjectionManagerExt` + `MediaCodec`. Built to `assets/quest-flat-agent.jar`
 
 ## Third-party
