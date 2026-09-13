@@ -33,7 +33,8 @@ pub struct StreamConfig {
 #[derive(Clone, Debug)]
 pub enum Status {
     Connecting,
-    Streaming { width: u32, height: u32, fps: f32 },
+    /// `decode_ms`: rolling average decode time per frame in milliseconds.
+    Streaming { width: u32, height: u32, fps: f32, decode_ms: f32 },
     Error(String),
     Stopped,
 }
@@ -75,13 +76,16 @@ pub struct StreamHandle {
     sockets: Arc<Mutex<Vec<TcpStream>>>,
     record_tx: Sender<RecordCmd>,
     recording: Arc<AtomicBool>,
+    /// When false the reconnect loop exits after the first drop/error,
+    /// leaving the status as `Error` so the user reconnects manually.
+    pub auto_reconnect: Arc<AtomicBool>,
     pub slot: Arc<Mutex<FrameSlot>>,
     pub status: Arc<Mutex<Status>>,
     pub config: StreamConfig,
 }
 
 impl StreamHandle {
-    pub fn start(config: StreamConfig, repaint: egui::Context) -> Self {
+    pub fn start(config: StreamConfig, repaint: egui::Context, auto_reconnect: Arc<AtomicBool>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let slot = Arc::new(Mutex::new(FrameSlot::default()));
         let status = Arc::new(Mutex::new(Status::Connecting));
@@ -95,15 +99,53 @@ impl StreamHandle {
             let status = status.clone();
             let sockets = sockets.clone();
             let recording = recording.clone();
+            let auto_reconnect = auto_reconnect.clone();
             let cfg = config.clone();
             std::thread::Builder::new()
                 .name("scrcpy-stream".into())
                 .spawn(move || {
                     let ctx = Ctx { stop: &stop, slot: &slot, status: &status, repaint: &repaint, sockets: &sockets, recording: &recording, record_rx: &record_rx };
-                    if let Err(e) = run(&cfg, &ctx) {
-                        if !stop.load(Ordering::Relaxed) {
-                            *status.lock().unwrap() = Status::Error(format!("{e:#}"));
-                            repaint.request_repaint();
+                    // Auto-reconnect with gentle backoff: the Quest drops the Wi-Fi
+                    // pipe now and then; keep the mirror alive without hammering a
+                    // flaky device. Same pattern as the flat-view reconnect loop.
+                    // When auto_reconnect is false, exits after first failure so the
+                    // user reconnects manually.
+                    let base = Duration::from_secs(2);
+                    let cap = Duration::from_secs(12);
+                    let mut backoff = base;
+                    while !stop.load(Ordering::Relaxed) {
+                        let started = Instant::now();
+                        let result = run(&cfg, &ctx);
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        match result {
+                            Ok(()) => {
+                                // Clean stop (e.g. user hit Disconnect) — exit.
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("[stream] dropped: {e:#}");
+                                if !auto_reconnect.load(Ordering::Relaxed) {
+                                    // Auto-reconnect disabled: surface the error and stop.
+                                    *status.lock().unwrap() = Status::Error(format!("{e:#}"));
+                                    repaint.request_repaint();
+                                    break;
+                                }
+                                // Streams that ran well → reconnect fast; repeated failures → back off.
+                                if started.elapsed() >= Duration::from_secs(8) {
+                                    backoff = base;
+                                }
+                                *status.lock().unwrap() = Status::Connecting;
+                                repaint.request_repaint();
+                                // Wait out the backoff period, waking immediately on stop.
+                                let mut waited = Duration::ZERO;
+                                while waited < backoff && !stop.load(Ordering::Relaxed) {
+                                    std::thread::sleep(Duration::from_millis(100));
+                                    waited += Duration::from_millis(100);
+                                }
+                                backoff = (backoff * 2).min(cap);
+                            }
                         }
                     }
                     recording.store(false, Ordering::Relaxed);
@@ -117,6 +159,7 @@ impl StreamHandle {
             sockets,
             record_tx,
             recording,
+            auto_reconnect,
             slot,
             status,
             config,
@@ -262,6 +305,10 @@ fn stream_loop(cfg: &StreamConfig, ctx: &Ctx, port: u16) -> Result<()> {
     let mut frame_h = 0u32;
     let mut frames_since = 0u32;
     let mut last_tick = Instant::now();
+    // Rolling decode-time accumulator (µs) for the 500 ms telemetry window.
+    let mut decode_us_since = 0u64;
+    // Last published decode_ms (shown in the status bar).
+    let mut last_decode_ms = 0.0f32;
 
     // Recording state. The clip is encoded from the *processed* (cropped, lens-
     // flattened, rotated) view so it matches what's on screen. Its dimensions are
@@ -312,7 +359,7 @@ fn stream_loop(cfg: &StreamConfig, ctx: &Ctx, port: u16) -> Result<()> {
                     sess_w = width;
                     sess_h = height;
                     decoder = Some(H264Decoder::new(width.max(1), height.max(1))?);
-                    *ctx.status.lock().unwrap() = Status::Streaming { width, height, fps: 0.0 };
+                    *ctx.status.lock().unwrap() = Status::Streaming { width, height, fps: 0.0, decode_ms: 0.0 };
                     ctx.repaint.request_repaint();
                 }
             }
@@ -325,7 +372,10 @@ fn stream_loop(cfg: &StreamConfig, ctx: &Ctx, port: u16) -> Result<()> {
                     decoder = Some(H264Decoder::new(w, h)?);
                 }
                 let dec = decoder.as_mut().unwrap();
-                for frame in dec.decode(&pkt.data)? {
+                let t_decode = Instant::now();
+                let frames = dec.decode(&pkt.data)?;
+                decode_us_since += t_decode.elapsed().as_micros() as u64;
+                for frame in frames {
                     frame_w = frame.width;
                     frame_h = frame.height;
 
@@ -366,13 +416,21 @@ fn stream_loop(cfg: &StreamConfig, ctx: &Ctx, port: u16) -> Result<()> {
                 }
 
                 if last_tick.elapsed() >= Duration::from_millis(500) {
-                    let fps = frames_since as f32 / last_tick.elapsed().as_secs_f32();
+                    let elapsed = last_tick.elapsed().as_secs_f32();
+                    let fps = frames_since as f32 / elapsed;
+                    last_decode_ms = if frames_since > 0 {
+                        decode_us_since as f32 / frames_since as f32 / 1000.0
+                    } else {
+                        last_decode_ms
+                    };
                     frames_since = 0;
+                    decode_us_since = 0;
                     last_tick = Instant::now();
                     *ctx.status.lock().unwrap() = Status::Streaming {
                         width: frame_w.max(sess_w),
                         height: frame_h.max(sess_h),
                         fps,
+                        decode_ms: last_decode_ms,
                     };
                 }
             }

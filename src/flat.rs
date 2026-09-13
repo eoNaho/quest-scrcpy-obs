@@ -413,7 +413,7 @@ fn run_gui(
         crate::ffmpeg::use_for_playback()
     ));
     let mut dec = H264Decoder::new(w, h)?;
-    *status.lock().unwrap() = Status::Streaming { width: w, height: h, fps: 0.0 };
+    *status.lock().unwrap() = Status::Streaming { width: w, height: h, fps: 0.0, decode_ms: 0.0 };
     repaint.request_repaint();
 
     // Audio plays through the same AAC player the scrcpy path uses; created
@@ -562,7 +562,7 @@ fn run_gui(
                 let fps = frames_since as f32 / last_tick.elapsed().as_secs_f32();
                 frames_since = 0;
                 last_tick = Instant::now();
-                *status.lock().unwrap() = Status::Streaming { width: fw, height: fh, fps };
+                *status.lock().unwrap() = Status::Streaming { width: fw, height: fh, fps, decode_ms: 0.0 };
             }
         }
     }

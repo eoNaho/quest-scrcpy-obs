@@ -20,6 +20,30 @@ const QUEST3_K1: f32 = 0.02;
 const QUEST3_K2: f32 = -0.20;
 const QUEST3_TILT: f32 = -1.0;
 
+/// Quest 2 — wider FOV fresnel lens; stronger barrel distortion.
+const QUEST2_CROP: [f32; 4] = [0.0, 0.0, 0.5, 1.0];
+const QUEST2_K1: f32 = 0.10;
+const QUEST2_K2: f32 = -0.25;
+const QUEST2_TILT: f32 = -1.0;
+
+/// Quest 3S — fresnel lens (same type as Quest 2), slightly smaller distortion.
+const QUEST3S_CROP: [f32; 4] = [0.0, 0.0, 0.5, 1.0];
+const QUEST3S_K1: f32 = 0.07;
+const QUEST3S_K2: f32 = -0.22;
+const QUEST3S_TILT: f32 = -1.0;
+
+/// Quest Pro — pancake lens; much flatter, barely any barrel distortion.
+const QUESTPRO_CROP: [f32; 4] = [0.0, 0.0, 0.5, 1.0];
+const QUESTPRO_K1: f32 = 0.01;
+const QUESTPRO_K2: f32 = -0.04;
+const QUESTPRO_TILT: f32 = 0.0;
+
+/// One-click quality presets — applied without reconnecting (UI-only knobs).
+/// Low-latency: smaller encode size + aggressive bitrate cap = fewer encode cycles.
+const PRESET_LOWLAT: (u32, u32, u32) = (1440, 60, 12); // (max_size, fps, mbps)
+/// High-quality: full 1920px encode at high bitrate — best detail for OBS.
+const PRESET_HIQUAL: (u32, u32, u32) = (1920, 60, 20);
+
 /// Quality knobs that require a (re)connect to take effect.
 #[derive(Clone, PartialEq)]
 struct Settings {
@@ -90,6 +114,8 @@ pub struct App {
     rotation_deg: f32,
 
     want_autostart: bool,
+    /// Whether the Panel view should automatically reconnect on Wi-Fi drops.
+    auto_reconnect: bool,
     /// A display query is requested but waits until it's safe to run (the list
     /// server would otherwise delete the jar out from under a connecting stream).
     need_display_fetch: bool,
@@ -173,6 +199,7 @@ impl App {
             lens_k2: cfg.lens_k2,
             rotation_deg: cfg.rotation_deg,
             want_autostart: startup.autostart,
+            auto_reconnect: true,
             need_display_fetch: false,
             fetch_inflight: false,
             remote_input: String::new(),
@@ -298,7 +325,8 @@ impl App {
             audio: self.settings.audio,
             audio_bit_rate: 128_000,
         };
-        self.stream = Some(StreamHandle::start(cfg, ctx.clone()));
+        let ar = Arc::new(std::sync::atomic::AtomicBool::new(self.auto_reconnect));
+        self.stream = Some(StreamHandle::start(cfg, ctx.clone(), ar));
     }
 
     fn disconnect(&mut self) {
@@ -346,6 +374,50 @@ impl App {
         self.lens_k1 = QUEST3_K1;
         self.lens_k2 = QUEST3_K2;
         self.rotation_deg = QUEST3_TILT;
+    }
+
+    /// Apply the baked-in "good Quest 2 view" in one click.
+    fn apply_quest2_preset(&mut self) {
+        self.uv = Rect::from_min_max(pos2(QUEST2_CROP[0], QUEST2_CROP[1]), pos2(QUEST2_CROP[2], QUEST2_CROP[3]));
+        self.lens_correct = true;
+        self.lens_k1 = QUEST2_K1;
+        self.lens_k2 = QUEST2_K2;
+        self.rotation_deg = QUEST2_TILT;
+    }
+
+    /// Apply the baked-in "good Quest Pro view" in one click.
+    fn apply_questpro_preset(&mut self) {
+        self.uv = Rect::from_min_max(pos2(QUESTPRO_CROP[0], QUESTPRO_CROP[1]), pos2(QUESTPRO_CROP[2], QUESTPRO_CROP[3]));
+        self.lens_correct = true;
+        self.lens_k1 = QUESTPRO_K1;
+        self.lens_k2 = QUESTPRO_K2;
+        self.rotation_deg = QUESTPRO_TILT;
+    }
+
+    /// Apply the baked-in "good Quest 3S view" in one click.
+    fn apply_quest3s_preset(&mut self) {
+        self.uv = Rect::from_min_max(pos2(QUEST3S_CROP[0], QUEST3S_CROP[1]), pos2(QUEST3S_CROP[2], QUEST3S_CROP[3]));
+        self.lens_correct = true;
+        self.lens_k1 = QUEST3S_K1;
+        self.lens_k2 = QUEST3S_K2;
+        self.rotation_deg = QUEST3S_TILT;
+    }
+
+    /// Apply a quality (max_size / fps / bitrate) preset without disconnecting.
+    /// A reconnect is still needed for the new settings to take effect on-device,
+    /// but the controls are updated immediately so the user sees what will apply.
+    fn apply_quality_preset(&mut self, max_size: u32, fps: u32, mbps: u32) {
+        self.settings.max_size = max_size;
+        self.settings.max_fps = fps;
+        self.settings.bitrate_mbps = mbps;
+    }
+
+    /// Propagate the current `auto_reconnect` flag to a running stream so the
+    /// toggle takes effect immediately without requiring a full reconnect.
+    fn sync_auto_reconnect(&self) {
+        if let Some(s) = &self.stream {
+            s.auto_reconnect.store(self.auto_reconnect, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Snapshot the persistable settings from the current UI state.
@@ -880,6 +952,38 @@ impl App {
             });
 
             ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Quality preset:");
+                let (ll_size, ll_fps, ll_mbps) = PRESET_LOWLAT;
+                let is_lowlat = self.settings.max_size == ll_size
+                    && self.settings.max_fps == ll_fps
+                    && self.settings.bitrate_mbps == ll_mbps;
+                if ui
+                    .add(egui::Button::selectable(is_lowlat, "⚡ Low-Latency"))
+                    .on_hover_text(format!(
+                        "{}px · {} fps · {} Mbps — fastest encode, minimal pipeline delay",
+                        ll_size, ll_fps, ll_mbps
+                    ))
+                    .clicked()
+                {
+                    self.apply_quality_preset(ll_size, ll_fps, ll_mbps);
+                }
+                let (hq_size, hq_fps, hq_mbps) = PRESET_HIQUAL;
+                let is_hiqual = self.settings.max_size == hq_size
+                    && self.settings.max_fps == hq_fps
+                    && self.settings.bitrate_mbps == hq_mbps;
+                if ui
+                    .add(egui::Button::selectable(is_hiqual, "🎬 High-Quality"))
+                    .on_hover_text(format!(
+                        "{}px · {} fps · {} Mbps — best visual fidelity for OBS recording",
+                        hq_size, hq_fps, hq_mbps
+                    ))
+                    .clicked()
+                {
+                    self.apply_quality_preset(hq_size, hq_fps, hq_mbps);
+                }
+            });
+
             ui.horizontal(|ui| {
                 let streaming = self.stream.is_some() || self.flat.is_some();
                 if !streaming {
@@ -904,8 +1008,8 @@ impl App {
                     // warped) with the crop/flatten tools.
                     if quest
                         && ui
-                            .add_enabled(enabled, egui::Button::new("Panel view"))
-                            .on_hover_text("Raw panel mirror (stereo, lens-warped) — enables the crop/flatten tools")
+                            .add_enabled(enabled, egui::Button::new("▶ Panel view"))
+                            .on_hover_text("Connect as raw panel mirror (stereo, lens-warped) — use the crop / flatten tools below to extract a single eye")
                             .clicked()
                     {
                         self.connect(&ctx);
@@ -926,6 +1030,22 @@ impl App {
                         } else {
                             self.connect(&ctx);
                         }
+                    }
+                }
+
+                // Auto-reconnect toggle — only relevant for the Panel view (scrcpy path).
+                // Flat view has its own unconditional reconnect loop.
+                if self.stream.is_some() {
+                    ui.separator();
+                    let changed = ui
+                        .checkbox(&mut self.auto_reconnect, "🔁 Auto-reconnect")
+                        .on_hover_text(
+                            "When enabled, the Panel view reconnects automatically after a Wi-Fi drop.\n\
+                             Disable to get a manual error instead.",
+                        )
+                        .changed();
+                    if changed {
+                        self.sync_auto_reconnect();
                     }
                 }
 
@@ -1031,11 +1151,13 @@ impl App {
                 ui.spinner();
                 ui.label("Connecting…");
             }
-            Status::Streaming { width, height, fps } => {
-                ui.colored_label(
-                    Color32::from_rgb(0x4c, 0xd9, 0x6a),
-                    format!("● {width}×{height}  ·  {fps:.0} fps"),
-                );
+            Status::Streaming { width, height, fps, decode_ms } => {
+                let label = if decode_ms > 0.1 {
+                    format!("🟢 {width}×{height}  ·  {fps:.1} fps  ·  decode: {decode_ms:.1} ms")
+                } else {
+                    format!("🟢 {width}×{height}  ·  {fps:.1} fps")
+                };
+                ui.colored_label(Color32::from_rgb(0x4c, 0xd9, 0x6a), label);
             }
             Status::Error(e) => {
                 ui.colored_label(Color32::from_rgb(0xff, 0x6b, 0x6b), format!("⚠ {e}"));
@@ -1049,13 +1171,11 @@ impl App {
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("cropbar").show_inside(ui, |ui| {
             ui.add_space(3.0);
-            // The crop / zoom / lens / tilt tools only apply to the raw (stereo,
-            // lens-warped) panel mirror. In flat mode (the default for Meta/Quest)
-            // the device already composites a flat, full, undistorted view — so
-            // hide them. They re-appear for the Panel view or non-Meta devices.
-            let show_tools =
-                self.flat.is_none() && (self.stream.is_some() || !self.selected_is_quest());
-            if !show_tools {
+            // The crop / zoom / lens / tilt tools apply to the raw (stereo, lens-warped)
+            // panel mirror. They are always visible when NOT in flat mode so the user
+            // can pre-configure crop / k1 / k2 / tilt before connecting.
+            // In flat mode the device already composites a flat, undistorted view — hide them.
+            if self.flat.is_some() {
                 ui.label(
                     egui::RichText::new(
                         "🥽 Flat view — whole undistorted stream (crop / lens / tilt not needed)",
@@ -1075,6 +1195,33 @@ impl App {
                     .clicked()
                 {
                     self.apply_quest3_preset();
+                }
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("🥽 Quest 3S").strong(),
+                    ))
+                    .on_hover_text("Apply the Quest 3S preset: left eye, fresnel lens correction (moderate)")
+                    .clicked()
+                {
+                    self.apply_quest3s_preset();
+                }
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("🥽 Quest 2").strong(),
+                    ))
+                    .on_hover_text("Apply the Quest 2 preset: left eye, stronger barrel lens correction")
+                    .clicked()
+                {
+                    self.apply_quest2_preset();
+                }
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("🥽 Quest Pro").strong(),
+                    ))
+                    .on_hover_text("Apply the Quest Pro preset: left eye, pancake lens (minimal correction)")
+                    .clicked()
+                {
+                    self.apply_questpro_preset();
                 }
                 ui.separator();
                 ui.label("Crop:");
